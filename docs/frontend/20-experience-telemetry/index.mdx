@@ -146,6 +146,10 @@ class TelemetryClient {
     return id;
   }
 
+  // session_id: UUID v4 (ex: 550e8400-e29b-41d4-a716-446655440000)
+  // Distinto do trace_id OTel (32 hex chars) do backend — ambos coexistem
+  // no mesmo evento de log para correlação entre camadas (ver Módulo 14).
+
   track(name: string, properties: EventProperties = {}) {
     const event: TelemetryEvent = {
       name,

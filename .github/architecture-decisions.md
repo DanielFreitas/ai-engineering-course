@@ -117,9 +117,45 @@ Cada decisão segue o padrão ADR (Architecture Decision Record):
 
 ---
 
-## Decisões pendentes (a definir no checkpoint do núcleo)
+## ADR-008: Sliding window com tiktoken como estratégia de truncamento de histórico
 
-- [ ] Estratégia de truncamento de histórico: sliding window vs. sumarização automática
-- [ ] Framework de agentes: manual vs. LangChain vs. LlamaIndex (posição a definir)
-- [ ] Estratégia de rate limiting nos exemplos de prática
-- [ ] Estratégia de mock de LLM nos exercícios práticos (para não exigir API key)
+**Contexto:** O módulo 09 (Contexto, Memória e Estado) precisava de uma estratégia concreta para truncar o histórico de conversa sem sumarização automática.
+
+**Decisão:** Sliding window baseada em contagem de tokens via `tiktoken`, descartando mensagens mais antigas quando o total excede um threshold configurável.
+
+**Justificativa:**
+- Determinístico e previsível — sem chamada adicional ao modelo
+- `tiktoken` é a biblioteca oficial da OpenAI, zero overhead de dependência
+- Sumarização automática adiciona latência e custo extra; adequada apenas para casos avançados
+
+**Consequências:** O módulo 15 (LLMOps) pode mencionar sumarização como alternativa avançada, mas o padrão de referência para código é a sliding window.
+
+---
+
+## ADR-009: Loop de agente manual (sem framework de orquestração externo)
+
+**Contexto:** O módulo 10 (Tool Calling e Orquestração) precisava de uma abordagem para implementar o loop de raciocínio do agente.
+
+**Decisão:** Loop `for/while` manual em Python puro, sem LangChain, LlamaIndex ou AutoGen.
+
+**Justificativa:**
+- Transparência total — o aluno vê cada decisão do loop sem abstração
+- Frameworks adicionam curva de aprendizado e mudam rapidamente; o padrão manual é estável
+- Facilita testes unitários: cada passo do loop é uma função testável
+
+**Consequências:** LangChain e LlamaIndex são mencionados como alternativas no módulo 10 para produção em escala, mas os exercícios práticos usam o loop manual.
+
+---
+
+## ADR-010: Separação semântica entre trace_id e session_id
+
+**Contexto:** Módulos 14 (Observabilidade) e 20 (Telemetria) introduzem dois identificadores distintos que aparecem juntos nos mesmos logs JSON.
+
+**Decisão:** `trace_id` é o identificador OpenTelemetry (32 hex chars, gerado pelo SDK OTel); `session_id` é o identificador de sessão do usuário (UUID v4, gerado pela aplicação no frontend).
+
+**Justificativa:**
+- `trace_id` rastreia operações técnicas distribuídas entre serviços
+- `session_id` rastreia a jornada do usuário entre múltiplas requisições
+- Confundir os dois impede correlacionar telemetria de produto com traces de infraestrutura
+
+**Consequências:** Todo log estruturado de produção deve incluir ambos os campos quando disponíveis. Ver exemplo canônico no módulo 14.

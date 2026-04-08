@@ -61,6 +61,8 @@ Logs em texto livre são difíceis de correlacionar com traces. Logs em JSON com
 }
 ```
 
+> **`trace_id`** é um identificador OpenTelemetry formatado como 32 caracteres hexadecimais (ex: `8a3f2c1e4b5d6e7f...`). Gerado pelo SDK OTel para cada trace — distinto do `session_id`, que é um UUID v4 gerado pela aplicação para rastrear a sessão do usuário (ver [Módulo 20 — Telemetria de Experiência](../../frontend/20-experience-telemetry)).
+
 ---
 
 ## Instrumentando uma chamada de LLM
