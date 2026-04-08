@@ -1,13 +1,525 @@
 ﻿---
 sidebar_position: 4
-sidebar_label: "Embeddings, recuperação de informação e RAG"
-title: "Embeddings, recuperação de informação e RAG"
+sidebar_label: "Embeddings e RAG"
+title: "Embeddings e RAG"
 description: "Módulo 04 do AI Engineering Course."
 ---
 
-# Embeddings, recuperação de informação e RAG
+# Embeddings e RAG
 
-:::info Status do módulo
+## Objetivo
+
+Ao final deste módulo você consegue indexar documentos como embeddings, executar uma busca semântica e construir um pipeline RAG funcional que emprega contexto externo para gerar respostas fundamentadas.
+
+> Ampliação de: [Módulo 01 — Fundamentos](../01-ai-fundamentals) (padrão RAG) e [Módulo 03 — Engenharia de Prompts](../03-prompt-engineering) (injeção de contexto)
+
+---
+
+## Por que o modelo precisa de contexto externo
+
+LLMs são treinados em dados com uma data de corte. Eles não sabem sobre:
+- Documentos internos da empresa
+- Informações surgidas após o treinamento
+- Dados proprietários (manuais, contratos, wikis)
+
+A solução não é retreinar o modelo. É **injetar o contexto relevante em cada chamada** — e para isso usamos RAG.
+
+**RAG (Retrieval-Augmented Generation)** combina dois estágios:
+1. **Recuperação (Retrieval):** encontra os trechos de documento mais relevantes para a pergunta
+2. **Geração (Generation):** passa esses trechos ao modelo como contexto e pede a resposta
+
+---
+
+## Embeddings: representação vetorial de significado
+
+Um **embedding** é um vetor de números reais que representa o significado semântico de um texto. O modelo de embedding transforma texto em vetores de alta dimensão (ex: 1536 dimensões para `text-embedding-3-small`).
+
+Textos semanticamente próximos têm vetores próximos no espaço dimensional. Isso permite **busca por similaridade** — em vez de buscar por palavra-chave, buscamos por significado.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+def embed_text(texto: str) -> list[float]:
+    """Gera embedding de um texto usando o modelo canônico do curso."""
+    response = client.embeddings.create(
+        model="text-embedding-3-small",  # modelo canônico do curso
+        input=texto,
+    )
+    return response.data[0].embedding
+
+# Textos semanticamente próximos
+v1 = embed_text("Como cancelar minha assinatura?")
+v2 = embed_text("Quero encerrar meu plano mensal.")
+
+# Textos semanticamente distantes
+v3 = embed_text("Qual é a capital da França?")
+```
+
+### Similaridade cosseno
+
+A métrica padrão para comparar embeddings é a **similaridade cosseno** — mede o ângulo entre dois vetores (não a distância). Varia de -1 a 1; valores próximos de 1 indicam alta similaridade semântica.
+
+$$\text{cos\_sim}(A, B) = \frac{A \cdot B}{\|A\| \cdot \|B\|}$$
+
+```python
+import numpy as np
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    va = np.array(a)
+    vb = np.array(b)
+    return float(np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb)))
+```
+
+---
+
+## Pipeline de RAG
+
+O pipeline completo tem dois fluxos principais:
+
+```
+INDEXAÇÃO (uma vez, atualiza quando o documento muda)
+┌──────────┐   chunking   ┌──────────────┐   embedding   ┌──────────────┐
+│ Documento│ ──────────► │  Chunks de   │ ────────────► │  Vetores no  │
+│ original │              │  texto       │               │  banco       │
+└──────────┘              └──────────────┘               └──────────────┘
+
+CONSULTA (a cada pergunta do usuário)
+┌──────────┐   embedding   ┌──────────────┐   busca        ┌──────────────┐
+│ Pergunta │ ────────────► │ Vetor da     │ ─────────────► │  Top-K       │
+│ do usuário│              │ pergunta     │  por similaridade│  Chunks      │
+└──────────┘               └──────────────┘               └──────┬───────┘
+                                                                  │ contexto
+                                                                  ▼
+                                                         ┌──────────────┐
+                                                         │    LLM       │
+                                                         │  + prompt    │ → resposta
+                                                         └──────────────┘
+```
+
+---
+
+## Estratégias de chunking
+
+**Chunking** é o processo de dividir documentos longos em fragmentos menores para indexação. A estratégia impacta diretamente a qualidade da recuperação.
+
+| Estratégia | Quando usar | Tamanho típico |
+|---|---|---|
+| Por parágrafo | Documentação, artigos com estrutura clara | 100–300 tokens |
+| Por token fixo | Documentos sem estrutura clara | 200–500 tokens |
+| Sliding window | Quando o contexto entre parágrafos é importante | 300 tokens, 50 de overlap |
+| Por sentença | Respostas curtas e precisas | 50–100 tokens |
+| Semântico | Documentos com parágrafos temáticos | variável |
+
+```python
+from pydantic import BaseModel
+from datetime import datetime, timezone
+
+class DocumentChunk(BaseModel):
+    chunk_id: str
+    content: str
+    source: str        # arquivo ou URL de origem
+    position: int      # posição no documento (0-based)
+    created_at: datetime
+    metadata: dict = {}
+
+def chunk_por_paragrafo(
+    texto: str,
+    source: str,
+    max_tokens: int = 400,
+) -> list[DocumentChunk]:
+    """
+    Divide o texto por parágrafos.
+    Parágrafos menores que 50 caracteres são unidos ao próximo.
+    """
+    paragrafos = [p.strip() for p in texto.split("\n\n") if p.strip()]
+    chunks = []
+    buffer = ""
+    posicao = 0
+
+    for paragrafo in paragrafos:
+        # estimativa grosseira: ~4 chars por token
+        if len(buffer) + len(paragrafo) > max_tokens * 4:
+            if buffer:
+                chunks.append(DocumentChunk(
+                    chunk_id=f"{source}-{posicao}",
+                    content=buffer.strip(),
+                    source=source,
+                    position=posicao,
+                    created_at=datetime.now(timezone.utc),
+                ))
+                posicao += 1
+                buffer = ""
+        buffer += paragrafo + "\n\n"
+
+    if buffer.strip():
+        chunks.append(DocumentChunk(
+            chunk_id=f"{source}-{posicao}",
+            content=buffer.strip(),
+            source=source,
+            position=posicao,
+            created_at=datetime.now(timezone.utc),
+        ))
+
+    return chunks
+```
+
+**Regra crítica:** sempre use o **mesmo modelo de embedding** para indexar os documentos e para gerar o vetor da consulta. Modelos diferentes produzem espaços vetoriais incompatíveis.
+
+---
+
+## Indexação e recuperação com pgvector
+
+O curso usa **pgvector** (extensão do PostgreSQL) como banco vetorial primário. Não requer serviço adicional — usa o Postgres já presente no sistema.
+
+```sql
+-- Habilitar a extensão (uma vez por banco)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Tabela de chunks com vetor
+CREATE TABLE document_chunks (
+    id          SERIAL PRIMARY KEY,
+    chunk_id    TEXT UNIQUE NOT NULL,
+    content     TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    metadata    JSONB DEFAULT '{}',
+    embedding   vector(1536)  -- dimensão do text-embedding-3-small
+);
+
+-- Índice para busca aproximada (HNSW — melhor para produção)
+CREATE INDEX ON document_chunks USING hnsw (embedding vector_cosine_ops);
+```
+
+```python
+import psycopg2
+import json
+
+def indexar_chunks(
+    chunks: list[DocumentChunk],
+    conn: psycopg2.extensions.connection,
+) -> int:
+    """Gera embeddings e insere os chunks no banco."""
+    inseridos = 0
+    with conn.cursor() as cur:
+        for chunk in chunks:
+            vetor = embed_text(chunk.content)
+            cur.execute(
+                """
+                INSERT INTO document_chunks (chunk_id, content, source, position, created_at, metadata, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (chunk_id) DO UPDATE
+                    SET content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding
+                """,
+                (
+                    chunk.chunk_id,
+                    chunk.content,
+                    chunk.source,
+                    chunk.position,
+                    chunk.created_at,
+                    json.dumps(chunk.metadata),
+                    vetor,
+                ),
+            )
+            inseridos += 1
+    conn.commit()
+    return inseridos
+
+
+def retrieve_chunks(
+    query: str,
+    conn: psycopg2.extensions.connection,
+    top_k: int = 3,
+    min_similarity: float = 0.7,
+) -> list[dict]:
+    """Recupera os chunks mais similares à query."""
+    vetor_query = embed_text(query)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT chunk_id, content, source,
+                   1 - (embedding <=> %s::vector) AS similarity_score
+            FROM document_chunks
+            WHERE 1 - (embedding <=> %s::vector) >= %s
+            ORDER BY similarity_score DESC
+            LIMIT %s
+            """,
+            (vetor_query, vetor_query, min_similarity, top_k),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "chunk_id": r[0],
+            "content": r[1],
+            "source": r[2],
+            "similarity_score": float(r[3]),
+        }
+        for r in rows
+    ]
+```
+
+> Alternativas a pgvector para escala maior: Pinecone, Weaviate, Qdrant. Ver ADR-003 em `.github/architecture-decisions.md`.
+
+---
+
+## Grounding: injetando contexto no prompt
+
+**Grounding** é a ancoragem da resposta do modelo a fontes verificáveis. No RAG, o contexto recuperado é injetado no prompt com delimitadores claros.
+
+```python
+def build_context_prompt(chunks: list[dict], query: str) -> str:
+    """
+    Monta o prompt do usuário com o contexto recuperado.
+    Usa delimitadores explícitos para separar contexto da pergunta.
+    """
+    if not chunks:
+        return query  # sem contexto — o modelo responderá com seu conhecimento
+
+    contexto = "\n\n---\n\n".join(
+        f"[Fonte: {c['source']}]\n{c['content']}"
+        for c in chunks
+    )
+
+    return f"""<contexto>
+{contexto}
+</contexto>
+
+Com base apenas nas informações fornecidas no contexto acima, responda:
+{query}
+
+Se a resposta não estiver no contexto, diga: "Não encontrei essa informação na base de conhecimento."
+"""
+
+SYSTEM_PROMPT_RAG = """Você é um assistente que responde perguntas com base em documentos fornecidos.
+
+Regras:
+- Use apenas as informações do contexto fornecido para responder
+- Cite a fonte quando possível
+- Se a informação não estiver no contexto, informe claramente que não encontrou — não invente
+- Seja preciso e direto"""
+```
+
+---
+
+## Busca híbrida e reranking
+
+### Busca vetorial vs. lexical
+
+| Tipo | Vantagem | Desvantagem |
+|---|---|---|
+| Vetorial (semântica) | Encontra documentos relacionados mesmo sem palavras exatas | Pode ignorar termos técnicos específicos |
+| Lexical (BM25/keyword) | Excelente para termos técnicos, siglas, nomes próprios | Não entende semântica |
+| Híbrida | Cobertura maior, especialmente em domínios técnicos | Maior complexidade |
+
+Para a maioria dos casos de uso, **busca vetorial pura com bom chunking é suficiente** para começar. Adicione busca híbrida quando perceber que termos técnicos específicos não são encontrados.
+
+### Reranking
+
+**Reranking** é aplicar um modelo mais preciso sobre os K candidatos retornados pela busca para reordenar por relevância real antes de injetar no prompt. Reduz o número de chunks ruins no contexto ao custo de uma chamada adicional.
+
+```python
+# Exemplo de reranking simples com LLM (cohere ou cross-encoder são mais eficientes)
+def rerank_chunks(
+    query: str,
+    chunks: list[dict],
+    top_n: int = 3,
+) -> list[dict]:
+    """
+    Reordenar chunks por relevância usando o próprio LLM como juiz.
+    Para produção, prefira modelos de reranking dedicados (ex: Cohere Rerank).
+    """
+    if len(chunks) <= top_n:
+        return chunks
+
+    # Simplificação: retornar os chunks acima de um threshold mais alto
+    return sorted(chunks, key=lambda c: c["similarity_score"], reverse=True)[:top_n]
+```
+
+---
+
+## Tratando o caso "sem contexto relevante"
+
+Quando nenhum chunk supera o threshold de similaridade, o modelo não deve inventar informação:
+
+```python
+def responder_com_rag(
+    query: str,
+    conn: psycopg2.extensions.connection,
+    top_k: int = 3,
+    min_similarity: float = 0.7,
+) -> dict:
+    """Pipeline completo de RAG com fallback explícito."""
+    chunks = retrieve_chunks(query, conn, top_k=top_k, min_similarity=min_similarity)
+
+    if not chunks:
+        return {
+            "answer": "Não encontrei informação relevante na base de conhecimento para responder sua pergunta.",
+            "sources": [],
+            "has_relevant_context": False,
+        }
+
+    prompt_usuario = build_context_prompt(chunks, query)
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_RAG},
+            {"role": "user", "content": prompt_usuario},
+        ],
+        temperature=0.0,
+        max_tokens=600,
+    )
+
+    fontes = list({c["source"] for c in chunks})
+
+    return {
+        "answer": response.choices[0].message.content,
+        "sources": fontes,
+        "chunks_used": len(chunks),
+        "has_relevant_context": True,
+    }
+```
+
+---
+
+## Prática
+
+**Exercício: pipeline RAG simples com documentos em memória**
+
+Para não exigir configuração de banco de dados, este exercício usa uma lista Python como "banco vetorial" simulado.
+
+```python
+import os
+import json
+import numpy as np
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# ------- Documentos de exemplo -------
+DOCUMENTOS = [
+    {"id": "doc-1", "source": "manual.txt", "content": "Para resetar a senha, acesse Configurações > Segurança > Redefinir Senha e siga as instruções enviadas por email."},
+    {"id": "doc-2", "source": "manual.txt", "content": "O plano básico inclui 5 usuários e 10GB de armazenamento. O plano profissional inclui usuários ilimitados e 100GB."},
+    {"id": "doc-3", "source": "faq.txt", "content": "Para cancelar sua assinatura, acesse Conta > Plano > Cancelar Assinatura. A cobrança continua até o fim do período pago."},
+    {"id": "doc-4", "source": "faq.txt", "content": "Aceitamos pagamento por cartão de crédito, boleto e PIX. Parcelamento em até 12x sem juros no cartão."},
+    {"id": "doc-5", "source": "manual.txt", "content": "O suporte técnico está disponível de segunda a sexta, das 9h às 18h, pelo email suporte@empresa.com ou pelo chat no produto."},
+]
+
+
+# ------- Funções do pipeline -------
+def embed_text(texto: str) -> list[float]:
+    response = client.embeddings.create(model="text-embedding-3-small", input=texto)
+    return response.data[0].embedding
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    va, vb = np.array(a), np.array(b)
+    return float(np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb)))
+
+
+def indexar(documentos: list[dict]) -> list[dict]:
+    """Adiciona embeddings a cada documento."""
+    return [
+        {**doc, "embedding": embed_text(doc["content"])}
+        for doc in documentos
+    ]
+
+
+def retrieve_chunks(
+    query: str,
+    indice: list[dict],
+    top_k: int = 2,
+    min_similarity: float = 0.6,
+) -> list[dict]:
+    """Recupera os chunks mais relevantes."""
+    vetor_query = embed_text(query)
+    scored = [
+        {**doc, "score": cosine_similarity(vetor_query, doc["embedding"])}
+        for doc in indice
+    ]
+    return [
+        d for d in sorted(scored, key=lambda x: x["score"], reverse=True)
+        if d["score"] >= min_similarity
+    ][:top_k]
+
+
+def responder(query: str, indice: list[dict]) -> None:
+    chunks = retrieve_chunks(query, indice)
+
+    if not chunks:
+        print("Resposta: Não encontrei informação relevante para sua pergunta.\n")
+        return
+
+    contexto = "\n---\n".join(f"[{c['source']}] {c['content']}" for c in chunks)
+    prompt = f"<contexto>\n{contexto}\n</contexto>\n\nPergunta: {query}"
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Responda com base apenas no contexto fornecido. Se não estiver no contexto, diga que não encontrou a informação."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=300,
+    )
+
+    fontes = [c["source"] for c in chunks]
+    print(f"Pergunta: {query}")
+    print(f"Resposta: {response.choices[0].message.content}")
+    print(f"Fontes usadas: {fontes}")
+    print(f"Scores: {[round(c['score'], 3) for c in chunks]}\n")
+
+
+# ------- Execução -------
+if __name__ == "__main__":
+    print("Indexando documentos...")
+    indice = indexar(DOCUMENTOS)
+    print(f"{len(indice)} chunks indexados.\n")
+
+    perguntas = [
+        "Como eu faço para trocar minha senha?",
+        "Qual a diferença entre os planos?",
+        "Como cancelo minha conta?",
+        "Qual é a previsão do tempo para amanhã?",  # sem contexto relevante
+    ]
+
+    for pergunta in perguntas:
+        responder(pergunta, indice)
+```
+
+**Critérios de conclusão:**
+- As três primeiras perguntas retornam respostas baseadas nos documentos com fonte identificada
+- A quarta pergunta retorna a mensagem de fallback (sem contexto relevante)
+- Os scores de similaridade são exibidos e a pergunta relevante tem score > 0.6
+
+---
+
+## Resumo
+
+- **Embeddings** transformam texto em vetores que capturam significado semântico; textos similares têm vetores próximos
+- **Chunking** divide documentos em fragmentos indexáveis; o tamanho e a estratégia impactam a qualidade da recuperação
+- **RAG** combina recuperação semântica com geração: recupera chunks relevantes → injeta como contexto → modelo gera resposta fundamentada
+- Sempre use o **mesmo modelo de embedding** para indexar e para consultar
+- **Metadados de origem** em cada chunk permitem citações e rastreabilidade
+- Implemente fallback explícito quando nenhum chunk relevante for encontrado
+- **pgvector** é a solução canônica do curso — não adiciona novo serviço ao stack
+
+### Checklist de qualidade de RAG
+
+- [ ] Estratégia de chunking documentada e justificada para o tipo de conteúdo
+- [ ] Metadados de origem preservados em cada chunk (source, position, created_at)
+- [ ] Mesmo modelo usado para indexar e consultar
+- [ ] Threshold de similaridade mínimo definido (ex: 0.7)
+- [ ] Fallback explícito para "sem contexto relevante" — o modelo não alucina
+- [ ] Contexto injetado no prompt com delimitadores claros (`<contexto>`)
+- [ ] Número máximo de chunks por chamada definido (3–5)
+- [ ] Fonte das informações citável na resposta
 **Status:** `not_started` — conteúdo em construção.
 :::
 

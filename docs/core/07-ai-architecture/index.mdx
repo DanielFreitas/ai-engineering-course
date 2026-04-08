@@ -1,14 +1,408 @@
 ﻿---
 sidebar_position: 7
-sidebar_label: "Visão geral da arquitetura com IA"
-title: "Visão geral da arquitetura com IA"
+sidebar_label: "Arquitetura de Sistemas de IA"
+title: "Arquitetura de Sistemas de IA"
 description: "Módulo 07 do AI Engineering Course."
 ---
 
-# Visão geral da arquitetura com IA
+# Arquitetura de Sistemas de IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue desenhar o fluxo completo de uma feature de IA — desde a entrada do usuário até o retorno da resposta —, identificar os componentes e suas responsabilidades, e reconhecer os pontos de falha mais comuns.
+
+> Síntese do núcleo: este módulo referencia todos os módulos anteriores e fornece o mapa conceitual para os módulos de backend e frontend.
+
+---
+
+## De "funciona no notebook" a "funciona em produção"
+
+Uma feature de IA que funciona em um notebook Jupyter enfrenta um conjunto totalmente diferente de desafios em produção:
+
+| Notebook | Produção |
+|---|---|
+| Uma requisição por vez | N usuários simultâneos |
+| Sem estado entre células | Estado persistido entre sessões |
+| Sem limite de tempo | Timeout, SLA, UX de latência |
+| Custo ignorado | Custo por requisição × volume |
+| Sem erros inesperados | Rate limit, network failure, model downtime |
+| Sem observabilidade | Precisa saber o que está acontecendo |
+
+O objetivo deste módulo é mapear a distância entre esses dois mundos.
+
+---
+
+## Arquitetura de referência
+
+Uma feature de IA bem arquitetada tem os seguintes componentes:
+
+```
+                        ┌────────────────────────────────────────────────────┐
+                        │                      BACKEND                       │
+                        │                                                    │
+┌──────────┐  request  ┌┴──────────┐  call  ┌─────────────┐  API  ┌───────┐ │
+│          │──────────▶│           │───────▶│  Serviço    │──────▶│  LLM  │ │
+│ Frontend │           │   API     │        │  de IA      │◀──────│ (API) │ │
+│ (React)  │◀──────────│ (FastAPI) │◀───────│  (Serviço)  │       └───────┘ │
+│          │  stream/  └┬──────────┘        └──────┬──────┘                 │
+└──────────┘  response  │                          │                        │
+                        │                          │ lê/escreve             │
+                        │                   ┌──────▼──────┐                 │
+                        │                   │  Camada de  │                 │
+                        │                   │  Contexto   │                 │
+                        │                   │  e Estado   │                 │
+                        │                   └──────┬──────┘                 │
+                        │                          │                        │
+                        │              ┌───────────┼──────────┐             │
+                        │              ▼           ▼          ▼             │
+                        │         ┌────────┐ ┌─────────┐ ┌────────┐        │
+                        │         │ Cache  │ │   DB    │ │ Vector │        │
+                        │         │(Redis) │ │(Postgres)│ │  DB    │        │
+                        │         └────────┘ └─────────┘ └────────┘        │
+                        └────────────────────────────────────────────────────┘
+                                          │
+                                   ┌──────▼──────┐
+                                   │Observabilidade│
+                                   │(OTEL+Datadog)│
+                                   └─────────────┘
+```
+
+### Responsabilidades de cada componente
+
+| Componente | Responsabilidade | O que NÃO faz |
+|---|---|---|
+| **Frontend** | UI, streaming, estado de carregamento, cancelamento | Chama o modelo diretamente |
+| **API (FastAPI)** | Autenticação, validação, roteamento, rate limit | Contém lógica de IA misturada |
+| **Serviço de IA** | Monta contexto, chama modelo, valida resposta, aplica guardrails | Acessa banco diretamente; contém regra de negócio |
+| **Camada de Contexto** | Gerencia histórico, decide o que truncar, monta o prompt final | Chama o modelo |
+| **Persistência** | Armazena estado durável: histórico, embeddings, preferências | Raciocina sobre o conteúdo |
+| **Observabilidade** | Captura traces, métricas, logs de cada chamada | Aprendizado online |
+
+---
+
+## Contexto, memória e estado: diferenças
+
+Estes três termos são usados de formas diferentes neste curso:
+
+### Contexto de inferência
+Os tokens enviados ao modelo em uma única chamada. Inclui system prompt, histórico de mensagens, documentos de RAG. **Limite físico: a janela de contexto do modelo.**
+
+### Contexto de aplicação
+O estado acumulado de uma sessão ou tarefa, que pode exceder a janela. **Precisa ser gerenciado**: truncado, sumarizado ou particionado.
+
+### Estado
+Qualquer informação que precisa ser preservada entre operações. Tipos:
+- **Conversacional:** histórico da sessão ativa
+- **De tarefa:** progresso de um job de longa duração
+- **De usuário:** preferências, memória longa, perfil
+
+### Memória
+Subconjunto de estado com semântica de recuperação. Divide-se em:
+- **Curta (short-term):** histórico ativo da sessão; descartado ao fim da conversa
+- **Longa (long-term):** persistida no banco e recuperada por busca direta ou RAG
+
+```
+Chamada 1:              Chamada 2:              Chamada N:
+[sys][user1][ast1]  →   [sys][user1][ast1]  →   [truncado…][userN][astN]
+                        [user2][ast2]       →
+                                                Histórico antigo
+                                                → persistido no DB
+                                                → recuperado via RAG se relevante
+```
+
+> Ver: [Módulo 09 — Contexto, Memória e Estado](../../backend/09-context-memory-state)
+
+---
+
+## Fluxo síncrono vs. assíncrono
+
+A escolha do padrão de comunicação depende da latência esperada e da experiência do usuário desejada.
+
+### Fluxo síncrono com streaming (padrão para chat)
+
+```
+Frontend → POST /chat → Backend → modelo → stream de tokens → Frontend (SSE)
+```
+
+Adequado para: respostas conversacionais, quando o usuário está aguardando ativamente.
+
+```python
+# Exemplo simplificado — endpoint síncrono com streaming via SSE
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import asyncio
+
+app = FastAPI()
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    async def gerar():
+        async for chunk in servico_ia.stream(request.mensagem, request.session_id):
+            yield f"data: {chunk}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gerar(), media_type="text/event-stream")
+```
+
+### Fluxo assíncrono com polling/webhook (para tarefas longas)
+
+```
+Frontend → POST /tasks → Backend → fila → worker → modelo → resultado no DB
+Frontend ← GET /tasks/{id} ← Backend ← DB
+```
+
+Adequado para: geração de documentos longos, pipelines de múltiplos passos, processamento em batch.
+
+```python
+# Exemplo simplificado — endpoint assíncrono com status de tarefa
+@app.post("/tasks")
+async def criar_tarefa(request: TarefaRequest) -> dict:
+    task_id = await fila.publicar(request.model_dump())
+    return {"task_id": task_id, "status": "pending"}
+
+@app.get("/tasks/{task_id}")
+async def status_tarefa(task_id: str) -> dict:
+    return await repositorio.buscar_tarefa(task_id)
+```
+
+> Ver: [Módulo 12 — Pub/Sub e Async](../../backend/12-pubsub-async)
+
+---
+
+## Camada de orquestração
+
+O **orquestrador** (ou serviço de IA) é o componente central. Ele:
+1. Recebe a entrada do usuário (já validada pelo endpoint)
+2. Recupera o contexto necessário (histórico, dados de RAG)
+3. Monta o prompt completo
+4. Chama o modelo
+5. Valida a saída
+6. Persiste o turno no histórico
+7. Retorna ao endpoint
+
+```python
+# Estrutura canônica de um serviço de IA
+class ServicoChat:
+    def __init__(
+        self,
+        cliente_llm: LLMClient,
+        repositorio_historico: HistoricoRepository,
+        retriever: RAGRetriever | None = None,
+    ):
+        self._llm = cliente_llm
+        self._historico = repositorio_historico
+        self._retriever = retriever
+
+    async def responder(self, mensagem: str, session_id: str) -> str:
+        # 1. Buscar histórico da sessão
+        historico = await self._historico.buscar(session_id)
+
+        # 2. Recuperar contexto externo (opcional)
+        contexto_rag = []
+        if self._retriever:
+            contexto_rag = await self._retriever.recuperar(mensagem)
+
+        # 3. Montar o contexto para inferência (truncando se necessário)
+        contexto_inferencia = montar_contexto(
+            historico=historico,
+            mensagem_atual=mensagem,
+            chunks_rag=contexto_rag,
+        )
+
+        # 4. Chamar o modelo
+        resposta = await self._llm.completar(contexto_inferencia)
+
+        # 5. Persistir turno
+        await self._historico.salvar_turno(
+            session_id=session_id,
+            user_msg=mensagem,
+            assistant_msg=resposta,
+        )
+
+        return resposta
+```
+
+Esta separação respeita o ADR-006 (`.github/architecture-decisions.md`): lógica de negócio nunca misturada com chamada de modelo.
+
+---
+
+## Observabilidade como requisito arquitetural
+
+Em sistemas com IA, observabilidade não é uma adição posterior — é um requisito de design. Sem ela, problemas em produção levam horas para ser diagnosticados.
+
+O que rastrear em cada chamada:
+
+```python
+# Pontos de observabilidade em um serviço de IA
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+async def responder_com_trace(mensagem: str, session_id: str) -> str:
+    with tracer.start_as_current_span("ai.chat.respond") as span:
+        span.set_attribute("session.id", session_id)
+        span.set_attribute("input.length", len(mensagem))
+
+        with tracer.start_as_current_span("ai.retrieval"):
+            chunks = await retriever.recuperar(mensagem)
+            span.set_attribute("retrieval.chunks_found", len(chunks))
+
+        with tracer.start_as_current_span("ai.llm.call") as llm_span:
+            resposta, usage = await llm.completar_com_usage(mensagem, chunks)
+            llm_span.set_attribute("llm.prompt_tokens", usage.prompt_tokens)
+            llm_span.set_attribute("llm.completion_tokens", usage.completion_tokens)
+            llm_span.set_attribute("llm.model", usage.model)
+
+        return resposta
+```
+
+> Ver: [Módulo 14 — Observabilidade com OpenTelemetry](../../backend/14-observability-otel-datadog)
+
+---
+
+## Pontos de falha e resiliência
+
+Identificar pontos de falha antes de construir é mais barato do que descobrir em produção:
+
+| Ponto de falha | Causa | Estratégia de mitigação |
+|---|---|---|
+| API do modelo indisponível | Outage do provedor | Retry com backoff; modelo de fallback; cache de respostas comuns |
+| Rate limit da API | Pico de uso | Fila assíncrona; circuit breaker; rate limit por usuário |
+| Contexto muito longo | Histórico acumulado | Truncamento pela janela; sumarização periódica |
+| Resposta inválida do modelo | JSON malformado; campos ausentes | Retry com instrução diferente; fallback para resposta padronizada |
+| Banco de dados lento | Indexação de embeddings; histórico longo | Cache Redis para sessão ativa; pgvector com índice HNSW |
+| Vazamento de memória em workers | Streaming de longa duração | Timeout por streaming; graceful shutdown |
+
+```python
+# Circuit breaker simplificado para o serviço de LLM
+class CircuitBreaker:
+    def __init__(self, limite_falhas: int = 5, janela_segundos: int = 60):
+        self._falhas = 0
+        self._limite = limite_falhas
+        self._janela = janela_segundos
+        self._aberto_ate: float = 0.0
+
+    def pode_chamar(self) -> bool:
+        import time
+        if time.monotonic() < self._aberto_ate:
+            return False  # circuito aberto — não chamar
+        return True
+
+    def registrar_falha(self) -> None:
+        import time
+        self._falhas += 1
+        if self._falhas >= self._limite:
+            self._aberto_ate = time.monotonic() + self._janela
+            self._falhas = 0  # reset para próxima janela
+
+    def registrar_sucesso(self) -> None:
+        self._falhas = 0
+```
+
+---
+
+## Ciclo de vida de uma feature com IA
+
+Uma feature de IA não vai de "prova de conceito" direto para produção estável. O ciclo típico:
+
+```
+1. Protótipo (notebook)
+   → Validar se o problema é resolvível com IA
+   → Não pensar em escala ainda
+
+2. MVP (serviço mínimo)
+   → API básica, sem estado persistido
+   → Avaliação com conjunto de cases fixo (Módulo 05)
+   → Logging mínimo
+
+3. Beta (produção limitada)
+   → Persistência de contexto/histórico
+   → Observabilidade com traces
+   → Rate limiting; guardrails básicos
+   → Comparação com baseline antes de promover
+
+4. Produção (feature estável)
+   → Monitoramento contínuo de qualidade
+   → A/B testing de versões de prompt
+   → Avaliação online (feedback do usuário)
+   → Processo de rollback definido
+```
+
+> Ver: [Módulo 15 — LLMOps](../../backend/15-llmops-lifecycle)
+
+---
+
+## Prática
+
+**Exercício: arquitetura de feature**
+
+Escolha uma das features abaixo e produza:
+
+1. **Diagrama de componentes** (caixas e setas) com frontend, backend, modelo e armazenamento
+2. **Tabela de responsabilidades** de cada componente
+3. **Identificação de 2 pontos de falha** com mitigação
+
+**Features disponíveis:**
+
+**A) Assistente de suporte a pedidos**
+- O usuário pergunta sobre o status do pedido em linguagem natural
+- O sistema consulta o banco de pedidos e responde usando o modelo
+
+**B) Resumidor de documentos internos**
+- O usuário faz upload de um PDF
+- O sistema extrai o texto, resume em bullet points e armazena o resumo
+
+**C) Chatbot com memória de conversa**
+- O usuário conversa com o chatbot
+- O histórico é persistido entre sessões; o chatbot lembra de interações anteriores
+
+<details>
+<summary>Referência para a feature A (abra após tentar)</summary>
+
+**Diagrama:**
+```
+Frontend → POST /chat → API (FastAPI)
+  → [autenticação, rate limit, validação]
+  → Serviço de Chat
+      → buscar histórico da sessão (Redis/DB)
+      → buscar pedido do usuário (DB de pedidos)
+      → montar contexto: [sys prompt][histórico][dados do pedido][msgUsuario]
+      → chamar GPT-4o-mini
+      → validar resposta
+      → salvar turno no histórico
+  → StreamResponse (SSE) → Frontend
+```
+
+**Responsabilidades:**
+- API: autenticação, rate limit, roteamento, validação Pydantic
+- ServiçoChat: orquestração do fluxo, montagem de contexto, chamada ao modelo
+- QueryPedidos: busca no banco relacional — retorna dados do pedido do usuário autenticado
+- HistoricoRepository: lê/escreve histórico de conversa no Redis (sessão ativa) ou Postgres (longo prazo)
+
+**Pontos de falha:**
+1. API do LLM indisponível → fallback: resposta pré-definida informando instabilidade + log do erro
+2. Contexto muito longo (usuário com muitos pedidos) → truncamento do contexto; injetar apenas os 3 pedidos mais recentes
+
+</details>
+
+---
+
+## Resumo
+
+- Uma feature de IA em produção tem pelo menos 5 componentes: frontend, API, serviço de IA, armazenamento, observabilidade
+- O **serviço de IA** (orquestrador) monta contexto, chama modelo e valida resposta — separado da lógica de negócio
+- **Contexto**, **estado** e **memória** têm significados distintos — cada um tem um responsável claro
+- **Fluxo síncrono com streaming** para experiências conversacionais; **fluxo assíncrono** para tarefas longas
+- **Observabilidade** é requisito de design, não adição posterior — rastrear tokens, latência e erros desde o início
+- Identificar pontos de falha antes de construir: API do modelo, rate limit, contexto longo, resposta inválida
+- O ciclo de vida de uma feature tem 4 estágios: protótipo → MVP → beta → produção
+
+### Checklist de arquitetura de IA
+
+- [ ] O modelo é chamado apenas pelo serviço de IA, nunca pelo endpoint diretamente?
+- [ ] O estado (histórico, preferências) tem dono e storage definidos?
+- [ ] O fluxo assíncrono está planejado para operações de alta latência?
+- [ ] Pontos de observabilidade estão marcados no design (não adicionados depois)?
+- [ ] Há fallback para quando o modelo não está disponível?
+- [ ] Dados sensíveis do contexto estão identificados e têm tratamento definido?
+- [ ] O diagrama pode ser explicado a um novo desenvolvedor em 5 minutos?

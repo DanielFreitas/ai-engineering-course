@@ -1,6 +1,8 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 
 const config: Config = {
   title: 'AI Engineering Course',
@@ -31,6 +33,9 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/docs',
+          numberPrefixParser: false,
+          remarkPlugins: [remarkMath],
+          rehypePlugins: [rehypeKatex],
         },
         blog: false,
         theme: {
@@ -38,6 +43,15 @@ const config: Config = {
         },
       } satisfies Preset.Options,
     ],
+  ],
+
+  stylesheets: [
+    {
+      href: 'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css',
+      type: 'text/css',
+      integrity: 'sha384-n8MVd4RsNIU0KOVEMckDMkFhBnGIb0e3zom2krgXVBMmDPMBn0G/NAif+W2BQNO',
+      crossorigin: 'anonymous',
+    },
   ],
 
   themeConfig: {

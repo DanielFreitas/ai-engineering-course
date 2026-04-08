@@ -1,14 +1,362 @@
 ﻿---
 sidebar_position: 3
-sidebar_label: "Engenharia de prompt e saídas confiáveis"
-title: "Engenharia de prompt e saídas confiáveis"
+sidebar_label: "Engenharia de prompts"
+title: "Engenharia de prompts"
 description: "Módulo 03 do AI Engineering Course."
 ---
 
-# Engenharia de prompt e saídas confiáveis
+# Engenharia de prompts
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue escrever prompts estruturados com saída previsível, usar few-shot examples, versionar prompts como artefatos de software e validar respostas antes de usá-las.
+
+> Ampliação de: [Módulo 02 — Integração com APIs de LLMs](../02-llm-api-integration)
+
+---
+
+## Prompt como especificação de comportamento
+
+Um prompt não é uma mensagem — é uma especificação. O mesmo resultado que pode ser obtido com um algoritmo determinístico precisa ser descrito ao modelo de forma clara o suficiente para que ele produza uma saída consistente.
+
+A diferença entre um prompt fraco e um prompt eficaz não está na criatividade da formulação. Está na:
+
+- **Especificidade:** o modelo sabe exatamente o que fazer
+- **Estrutura:** o modelo sabe como formatar a resposta
+- **Exemplos:** o modelo sabe o padrão esperado
+- **Restrições:** o modelo sabe o que não fazer
+
+Engenharia de prompts, neste curso, é tratada como prática de engenharia de software: com versionamento, testes e critérios objetivos de qualidade.
+
+---
+
+## Anatomia de um prompt eficaz
+
+Um prompt bem estruturado tem três componentes:
+
+### 1. System prompt: a especificação
+
+O `system` define o comportamento do modelo para a tarefa. Inclui:
+- O papel e o contexto ("Você é um extrator de informações estruturadas...")
+- O formato de saída esperado com o schema explícito
+- Restrições objetivas ("máximo de 5 itens", "apenas estes valores")
+- Pelo menos um exemplo de entrada e saída esperada
+
+### 2. User prompt: a entrada variável
+
+O `user` contém a entrada específica da chamada — o dado bruto a ser processado. Deve ser separado das instruções por delimitadores.
+
+### 3. Contexto (opcional)
+
+Informações adicionais como histórico de conversa ou dados recuperados por RAG, passados como mensagens `assistant` ou dentro do `user` com delimitadores.
+
+---
+
+## Construindo um prompt estruturado
+
+### Exemplo: extração de informações de produto
+
+**Versão fraca (evitar):**
+
+```python
+prompt = "Extraia as informações do produto deste texto: " + texto
+```
+
+Problema: o modelo não sabe qual informação extrair, em qual formato retornar, ou o que fazer quando a informação estiver ausente.
+
+**Versão estruturada:**
+
+```python
+# prompts/extrator_produto_v1.txt (arquivo versionado)
+SYSTEM_PROMPT = """Você é um extrator de dados de produtos a partir de texto livre.
+
+Dado um texto descritivo de produto, extraia as seguintes informações e retorne um JSON com este schema exato:
+
+{
+  "nome_produto": "string — nome completo do produto",
+  "preco": number | null — preço em reais, apenas o número (sem R$). null se não informado,
+  "disponivel": boolean — true se em estoque, false se indisponível, null se não mencionado,
+  "caracteristicas": ["string"] — lista de características principais, máximo 5 itens
+}
+
+Regras:
+- Retorne apenas o JSON, sem texto adicional
+- Se um campo não estiver no texto, use null (booleanos) ou [] (listas)
+- "disponivel" é true por padrão a menos que o texto indique indisponibilidade
+
+Exemplo de entrada:
+<texto>
+Tênis Running Pro X, disponível em preto e branco. R$ 349,90.
+Amortecimento de gel, solado antiderrapante, cabedal em mesh respirável.
+</texto>
+
+Exemplo de saída:
+{
+  "nome_produto": "Tênis Running Pro X",
+  "preco": 349.90,
+  "disponivel": true,
+  "caracteristicas": ["amortecimento de gel", "solado antiderrapante", "cabedal em mesh respirável"]
+}"""
+```
+
+```python
+# extrator.py
+import json
+import os
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import Optional
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+class ProdutoExtraido(BaseModel):
+    nome_produto: str
+    preco: Optional[float] = None
+    disponivel: Optional[bool] = None
+    caracteristicas: list[str] = Field(default_factory=list, max_length=5)
+
+
+def extrair_produto(texto: str) -> ProdutoExtraido:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"<texto>\n{texto}\n</texto>"},
+        ],
+        temperature=0.0,       # extração: determinismo máximo
+        max_tokens=400,
+        response_format={"type": "json_object"},
+    )
+
+    raw = response.choices[0].message.content
+    dados = json.loads(raw)
+    return ProdutoExtraido.model_validate(dados)
+```
+
+---
+
+## Few-shot examples: quando e como usar
+
+**Few-shot prompting** é a técnica de incluir exemplos no contexto para guiar o comportamento do modelo. É eficaz quando:
+
+- O formato de saída é não-óbvio ou incomum
+- Há edge cases que precisam de tratamento específico
+- A tarefa tem nuances semânticas que seriam difíceis de explicar em regras
+
+### Bons exemplos vs. exemplos ruins
+
+**Ruim:** exemplos triviais e fáceis demais
+
+```
+Entrada: "Produto A, R$ 10"
+Saída: {"nome_produto": "Produto A", "preco": 10.0, ...}
+```
+
+**Bom:** exemplos que cobrem variações reais
+
+```
+# Exemplo 1 — preço em formato com vírgula
+Entrada: "Câmera DSLR Pro 24MP. Preço: R$2.499,00. Em estoque."
+Saída: {"nome_produto": "Câmera DSLR Pro 24MP", "preco": 2499.0, ...}
+
+# Exemplo 2 — sem preço informado
+Entrada: "Fone de ouvido bluetooth. Para mais informações, consulte o vendedor."
+Saída: {"nome_produto": "Fone de ouvido bluetooth", "preco": null, ...}
+
+# Exemplo 3 — produto indisponível
+Entrada: "Teclado mecânico RGB. Temporariamente fora de estoque."
+Saída: {..., "disponivel": false, ...}
+```
+
+Cada exemplo deve cobrir uma variação real que existe nos dados de produção.
+
+---
+
+## Templates parametrizados
+
+Construir prompts como templates impede o anti-padrão de prompt hardcoded no código de negócio e permite testes independentes.
+
+```python
+# prompts/classificador_ticket_v2.txt
+TEMPLATE_CLASSIFICADOR = """Você é um classificador de tickets de suporte.
+
+Classifique o ticket abaixo em uma das seguintes categorias:
+- urgente: impacto no negócio imediato, cliente sem acesso ao produto
+- normal: problema presente mas com workaround disponível
+- baixa_prioridade: dúvida, melhoria ou feedback sem impacto operacional
+
+Retorne um JSON com: {{"categoria": "urgente"|"normal"|"baixa_prioridade", "justificativa": "string"}}
+
+Contexto do cliente: {contexto_cliente}
+Data do ticket: {data_ticket}
+
+<ticket>
+{texto_ticket}
+</ticket>"""
+```
+
+```python
+# uso do template
+def classificar_ticket(
+    texto: str,
+    contexto_cliente: str = "cliente sem informações adicionais",
+    data: str = "hoje",
+) -> dict:
+    prompt_usuario = TEMPLATE_CLASSIFICADOR.format(
+        contexto_cliente=contexto_cliente,
+        data_ticket=data,
+        texto_ticket=texto,
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "user", "content": prompt_usuario},
+        ],
+        temperature=0.0,
+        max_tokens=200,
+        response_format={"type": "json_object"},
+    )
+
+    return json.loads(response.choices[0].message.content)
+```
+
+---
+
+## Reduzindo ambiguidade
+
+Os erros mais comuns de prompt são instruções que parecem claras mas são interpretadas de forma inconsistente pelo modelo.
+
+| Instrução ambígua | Instrução precisa |
+|---|---|
+| "Seja conciso" | "Máximo de 3 frases" |
+| "Responda adequadamente" | "Responda apenas com o JSON especificado" |
+| "Use seu julgamento" | "Se não houver informação suficiente, retorne `null`" |
+| "Liste as características" | "Liste entre 1 e 5 características, uma por item" |
+| "Não invente" | "Se o campo não estiver no texto, use `null`" |
+
+**Regra prática:** se a instrução pode ser interpretada de dois jeitos diferentes, ela vai ser. Adicione um exemplo ou uma restrição objetiva.
+
+---
+
+## Versionamento de prompts
+
+Prompts são artefatos de software. Precisam de:
+
+- **Arquivo dedicado** (não embutido no código)
+- **Versionamento** no repositório com histórico de mudanças
+- **Testes** antes de promover para produção
+- **Rollback** possível quando uma mudança introduz regressão
+
+Estrutura recomendada:
+
+```
+prompts/
+├── extrator_produto_v1.txt   # versão inicial
+├── extrator_produto_v2.txt   # adição de campo "marca"
+├── classificador_ticket_v1.txt
+└── tests/
+    ├── test_extrator_produto.py
+    └── test_classificador_ticket.py
+```
+
+```python
+# Exemplo de teste de regressão de prompt
+import pytest
+from extrator import extrair_produto
+
+@pytest.mark.parametrize("texto,esperado", [
+    (
+        "Tênis Runner 42. R$ 199,90. Em estoque.",
+        {"nome_produto": "Tênis Runner 42", "preco": 199.90, "disponivel": True},
+    ),
+    (
+        "Produto X. Fora de estoque.",
+        {"nome_produto": "Produto X", "disponivel": False},
+    ),
+    (
+        "Câmera 4K. Consulte preço.",
+        {"preco": None},
+    ),
+])
+def test_extrator_produto(texto: str, esperado: dict):
+    resultado = extrair_produto(texto)
+    for campo, valor in esperado.items():
+        assert getattr(resultado, campo) == valor
+```
+
+> Ver: [Módulo 05 — Avaliação de LLMs](../05-llm-evaluation) para avaliação sistemática de prompts.
+
+---
+
+## Quando refatorar o prompt vs. mudar arquitetura
+
+Nem todo problema de qualidade de resposta se resolve com prompt. Saber a diferença evita desperdício de tempo.
+
+| Sintoma | Solução provável |
+|---|---|
+| Formato de saída inconsistente | Melhorar as instruções de schema no prompt |
+| Campos ausentes na extração | Adicionar exemplos few-shot com esses casos |
+| Respostas longas demais | Adicionar restrição de tamanho + exemplo |
+| Alucinação em perguntas factuais | Mudar arquitetura → RAG (não é problema de prompt) |
+| Modelo não sabe do evento X | Mudar arquitetura → RAG ou function calling |
+| Qualidade OK nos testes, ruim com dados reais | Os exemplos few-shot não cobrem a distribuição real |
+| Degradação de qualidade com histórico longo | Problema de gestão de contexto → módulo 09 |
+
+---
+
+## Prática
+
+**Exercício: extrator de informações de produto**
+
+Crie um prompt de sistema que extraia as seguintes informações de um texto de produto:
+- `nome_produto` (string)
+- `preco` (number, pode ser null)
+- `disponivel` (boolean, pode ser null)
+- `caracteristicas` (lista de strings, máximo 5 itens)
+
+**Requisitos:**
+1. O prompt usa `system` para instruções e `user` para o texto com delimitadores `<texto>...</texto>`
+2. O prompt inclui pelo menos 1 exemplo few-shot de entrada e saída
+3. O schema de saída está explícito no prompt
+4. A resposta é validada com Pydantic antes de retornar
+5. O prompt está em um arquivo separado (não embutido na função)
+
+**Textos de teste:**
+
+```python
+textos = [
+    "Notebook UltraSlim 14 polegadas, processador i5, 16GB RAM, SSD 512GB. R$ 3.499,99. Disponível para entrega imediata.",
+    "Smart TV 55' 4K. Display OLED, HDR10+, 4 entradas HDMI. Fora de estoque temporariamente.",
+    "Fone de ouvido sem fio. Para mais detalhes sobre preço, entre em contato com o vendedor.",
+]
+```
+
+**Critérios de conclusão:**
+- Os três textos retornam JSONs válidos com os 4 campos
+- O texto sem preço retorna `preco: null`
+- O texto com produto fora de estoque retorna `disponivel: false`
+- O prompt está em arquivo separado e é carregado em runtime
+
+---
+
+## Resumo
+
+- Prompt é uma **especificação de comportamento** — deve ser precisa, testável e versionável
+- O `system` contém a instrução; o `user` contém o dado de entrada — nunca misture
+- **Few-shot examples** melhoram consistência quando cobrem os casos reais do sistema
+- **Schema explícito no prompt** + **validação com Pydantic** = saídas confiáveis
+- Use **delimitadores** para separar seções e isolar a entrada do usuário
+- Prompts devem ser **versionados como código**: arquivo dedicado, histórico, testes de regressão
+- Quando a qualidade não melhora com prompt, investigar: é um problema de arquitetura (RAG, ferramentas)
+
+### Checklist de qualidade de prompts
+
+- [ ] O formato de saída está completamente especificado no system prompt?
+- [ ] Há pelo menos um exemplo few-shot para tarefas de extração ou classificação?
+- [ ] Todas as instruções são objetivas (sem "seja conciso", "use seu julgamento")?
+- [ ] O prompt está em arquivo versionado, não embutido no código de negócio?
+- [ ] A saída é validada com Pydantic ou schema antes de ser usada?
+- [ ] Há conjunto de testes que cobre ao menos 5 casos representativos?
+- [ ] `temperature=0.0` está configurado para tarefas determinísticas?

@@ -1,13 +1,553 @@
 ﻿---
 sidebar_position: 5
-sidebar_label: "Avaliação de sistemas com LLMs"
-title: "Avaliação de sistemas com LLMs"
+sidebar_label: "Avaliação de LLMs"
+title: "Avaliação de LLMs"
 description: "Módulo 05 do AI Engineering Course."
 ---
 
-# Avaliação de sistemas com LLMs
+# Avaliação de LLMs
 
-:::info Status do módulo
+## Objetivo
+
+Ao final deste módulo você consegue criar casos de teste para componentes de IA, medir relevância e fidelidade em pipelines RAG, comparar versões de prompt quantitativamente e detectar regressões automaticamente.
+
+> Relacionado com: [Módulo 03 — Engenharia de Prompts](../03-prompt-engineering) (prompts versionados como objeto de avaliação) e [Módulo 04 — Embeddings e RAG](../04-embeddings-rag) (métricas de retrieval)
+
+---
+
+## O custo de não avaliar
+
+Em software tradicional, testes unitários detectam quebras imediatamente. Em sistemas com IA, o código pode funcionar (sem exceptions) mas a qualidade degradar gradativamente — sem alertas.
+
+Cenários comuns que passam despercebidos sem avaliação sistemática:
+- Um prompt atualizado melhora um caso mas quebra outros três
+- O modelo retorna campos em formato diferente após uma atualização do provedor
+- A qualidade de resposta cai quando a base de dados de RAG cresce
+- Linguagem de entrada dos usuários reais não corresponde aos textos de desenvolvimento
+
+**Avaliação sistemática** é o mecanismo que torna o comportamento de um componente de IA observável e mensurável ao longo do tempo.
+
+---
+
+## "Parece bom" vs. "bom o suficiente"
+
+O maior obstáculo para avaliação em IA é a subjetividade. Para tornar avaliação reproduzível:
+
+| "Parece bom" (evitar) | "Bom o suficiente" (usar) |
+|---|---|
+| "A resposta está correta" | "O campo `sentimento` é `positivo` e o confidence é ≥ 0.7" |
+| "O resumo é bom" | "O resumo tem no máximo 50 palavras e não inventa informações ausentes no texto" |
+| "A busca funciona" | "Para 8 de 10 perguntas do dataset, o chunk correto está no top-3 resultados" |
+| "O modelo entende bem" | "Taxa de sucesso ≥ 85% em 50 casos representativos" |
+
+**Critério objetivo** = verificável por código, sem julgamento humano na iteração.
+
+---
+
+## Tipos de avaliação
+
+### Avaliação por componente (offline)
+
+Avalia um componente isolado com entradas e saídas conhecidas. Mais fácil de automatizar e mais preciso para identificar problemas.
+
+```
+Prompt de extração → [input: texto bruto] → [output esperado: JSON com campos X, Y, Z]
+Retrieval → [query] → [output esperado: chunk_id correto no top-3]
+```
+
+### Avaliação end-to-end (offline)
+
+Avalia o fluxo completo do usuário. Mais próximo do uso real, mas mais difícil de diagnosticar onde o problema ocorre.
+
+```
+[pergunta do usuário] → RAG pipeline → [resposta] → [critério: resposta usa a fonte correta]
+```
+
+### Avaliação contínua (online)
+
+Monitora qualidade em produção com dados reais. Pode usar feedback explícito (thumbs up/down) ou implícito (o usuário repetiu a pergunta?).
+
+> Ver: [Módulo 15 — LLMOps](../../backend/15-llmops-lifecycle) para avaliação contínua em produção.
+
+---
+
+## Construindo casos de teste
+
+Um caso de teste bem estruturado tem três partes:
+
+1. **Input:** a entrada fornecida ao componente
+2. **Expected output:** o que esperamos receber (exato ou parcial)
+3. **Criteria:** os critérios objetivos de aprovação
+
+```python
+from pydantic import BaseModel
+from typing import Any, Literal
+
+
+class EvaluationCriteria(BaseModel):
+    field: str
+    operator: Literal["eq", "in", "range", "contains", "not_empty"]
+    expected: Any
+
+
+class TestCase(BaseModel):
+    test_id: str
+    description: str
+    input: dict
+    expected_output: dict
+    criteria: list[EvaluationCriteria]
+    tags: list[str] = []
+
+
+# Exemplo: casos de teste para o extrator de sentimento
+CASOS_SENTIMENTO: list[TestCase] = [
+    TestCase(
+        test_id="test_sentiment_positive_review",
+        description="Avaliação claramente positiva deve retornar sentimento positivo",
+        input={"texto": "Produto excelente! Chegou antes do prazo e estava em ótimas condições."},
+        expected_output={"sentimento": "positivo"},
+        criteria=[
+            EvaluationCriteria(field="sentimento", operator="eq", expected="positivo"),
+            EvaluationCriteria(field="confianca", operator="range", expected=[0.7, 1.0]),
+        ],
+        tags=["typical"],
+    ),
+    TestCase(
+        test_id="test_sentiment_negative_review",
+        description="Reclamação explícita deve retornar sentimento negativo",
+        input={"texto": "Horrível. Atendimento péssimo, produto chegou danificado."},
+        expected_output={"sentimento": "negativo"},
+        criteria=[
+            EvaluationCriteria(field="sentimento", operator="eq", expected="negativo"),
+        ],
+        tags=["typical"],
+    ),
+    TestCase(
+        test_id="test_sentiment_neutral_factual",
+        description="Texto factual sem opinião explícita deve retornar neutro",
+        input={"texto": "Recebi o produto. Estava embalado."},
+        expected_output={"sentimento": "neutro"},
+        criteria=[
+            EvaluationCriteria(field="sentimento", operator="in", expected=["neutro", "positivo"]),
+        ],
+        tags=["edge_case", "ambiguous"],
+    ),
+    TestCase(
+        test_id="test_sentiment_mixed",
+        description="Texto com aspectos positivos e negativos — avaliar como neutro ou positivo",
+        input={"texto": "O produto é bom, mas a entrega demorou muito mais do que prometido."},
+        expected_output={"sentimento": "neutro"},
+        criteria=[
+            EvaluationCriteria(field="sentimento", operator="in", expected=["neutro", "negativo"]),
+            EvaluationCriteria(field="resumo", operator="not_empty", expected=True),
+        ],
+        tags=["edge_case", "mixed"],
+    ),
+    TestCase(
+        test_id="test_sentiment_confidence_field_present",
+        description="Resposta sempre deve ter os três campos — validação de schema",
+        input={"texto": "Ok."},
+        expected_output={},
+        criteria=[
+            EvaluationCriteria(field="sentimento", operator="in", expected=["positivo", "negativo", "neutro"]),
+            EvaluationCriteria(field="confianca", operator="range", expected=[0.0, 1.0]),
+            EvaluationCriteria(field="resumo", operator="not_empty", expected=True),
+        ],
+        tags=["schema", "edge_case"],
+    ),
+]
+```
+
+---
+
+## Executando avaliações
+
+```python
+import json
+import time
+import os
+from openai import OpenAI
+from pydantic import BaseModel
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+class TestResult(BaseModel):
+    test_id: str
+    passed: bool
+    actual_output: dict
+    failed_criteria: list[str]
+    latency_ms: int
+
+
+def avaliar_criterio(output: dict, criterio: EvaluationCriteria) -> bool:
+    """Verifica se um campo do output satisfaz um critério."""
+    valor = output.get(criterio.field)
+
+    if criterio.operator == "eq":
+        return valor == criterio.expected
+    elif criterio.operator == "in":
+        return valor in criterio.expected
+    elif criterio.operator == "range":
+        lo, hi = criterio.expected
+        return isinstance(valor, (int, float)) and lo <= valor <= hi
+    elif criterio.operator == "contains":
+        return criterio.expected in str(valor or "")
+    elif criterio.operator == "not_empty":
+        return valor is not None and valor != "" and valor != []
+    return False
+
+
+def executar_caso(caso: TestCase, fn_componente) -> TestResult:
+    """Executa um caso de teste e coleta resultados."""
+    inicio = time.monotonic()
+    output = fn_componente(**caso.input)
+    latencia = int((time.monotonic() - inicio) * 1000)
+
+    # Converter para dict se for um modelo Pydantic
+    if hasattr(output, "model_dump"):
+        output_dict = output.model_dump()
+    else:
+        output_dict = output if isinstance(output, dict) else {}
+
+    falhas = [
+        c.field
+        for c in caso.criteria
+        if not avaliar_criterio(output_dict, c)
+    ]
+
+    return TestResult(
+        test_id=caso.test_id,
+        passed=len(falhas) == 0,
+        actual_output=output_dict,
+        failed_criteria=falhas,
+        latency_ms=latencia,
+    )
+
+
+def executar_suite(casos: list[TestCase], fn_componente, prompt_version: str = "v1") -> dict:
+    """Executa todos os casos e gera relatório."""
+    resultados = [executar_caso(caso, fn_componente) for caso in casos]
+
+    aprovados = sum(1 for r in resultados if r.passed)
+    taxa = aprovados / len(resultados) if resultados else 0.0
+
+    print(f"\n=== Relatório de Avaliação — prompt {prompt_version} ===")
+    print(f"Total: {len(resultados)} | Aprovados: {aprovados} | Taxa: {taxa:.1%}")
+    print()
+
+    for r in resultados:
+        status = "✓" if r.passed else "✗"
+        print(f"  {status} {r.test_id} ({r.latency_ms}ms)")
+        if not r.passed:
+            print(f"    Falhas: {r.failed_criteria}")
+            print(f"    Saída real: {r.actual_output}")
+
+    return {"pass_rate": taxa, "aprovados": aprovados, "total": len(resultados)}
+```
+
+---
+
+## Comparando versões de prompt
+
+A avaliação se torna poderosa quando **compara versões**:
+
+```python
+def comparar_versoes(
+    casos: list[TestCase],
+    fn_v1,
+    fn_v2,
+    versao_v1: str = "v1",
+    versao_v2: str = "v2",
+) -> None:
+    """Compara dois prompts nos mesmos casos de teste."""
+    print(f"\n=== Comparação: {versao_v1} vs {versao_v2} ===\n")
+
+    resultados_v1 = [executar_caso(c, fn_v1) for c in casos]
+    resultados_v2 = [executar_caso(c, fn_v2) for c in casos]
+
+    taxa_v1 = sum(r.passed for r in resultados_v1) / len(resultados_v1)
+    taxa_v2 = sum(r.passed for r in resultados_v2) / len(resultados_v2)
+    melhoria = taxa_v2 - taxa_v1
+
+    print(f"{versao_v1}: {taxa_v1:.1%}")
+    print(f"{versao_v2}: {taxa_v2:.1%}")
+    print(f"Melhoria: {melhoria:+.1%}")
+
+    # Identificar regressões (passava antes, falhou agora)
+    regressoes = [
+        r2.test_id
+        for r1, r2 in zip(resultados_v1, resultados_v2)
+        if r1.passed and not r2.passed
+    ]
+    melhorias = [
+        r2.test_id
+        for r1, r2 in zip(resultados_v1, resultados_v2)
+        if not r1.passed and r2.passed
+    ]
+
+    if regressoes:
+        print(f"\n⚠ Regressões detectadas ({len(regressoes)} casos):")
+        for t in regressoes:
+            print(f"  - {t}")
+
+    if melhorias:
+        print(f"\n✓ Melhorias ({len(melhorias)} casos):")
+        for t in melhorias:
+            print(f"  + {t}")
+
+    # Decisão
+    if regressoes:
+        print(f"\nRecomendação: REVISAR — há regressões, mesmo com melhoria geral")
+    elif melhoria > 0:
+        print(f"\nRecomendação: PROMOVER {versao_v2}")
+    else:
+        print(f"\nRecomendação: MANTER {versao_v1}")
+```
+
+---
+
+## LLM-as-judge
+
+Quando o critério de avaliação não pode ser verificado por código (ex: "a resposta é factualmente correta?"), use um LLM como avaliador.
+
+**Limitações:**
+- LLMs têm **viés de posição** (preferem a primeira opção apresentada)
+- LLMs têm **viés de extensão** (preferem respostas mais longas)
+- LLMs têm **auto-viés** (o mesmo modelo prefere suas próprias respostas)
+
+**Como mitigar:**
+- Sempre peça **justificativa antes do veredito** (chain-of-thought)
+- Use `temperature=0.0` para reprodutibilidade
+- Valide periodicamente os vereditos do LLM com avaliação humana
+
+```python
+def llm_judge_fidelidade(
+    pergunta: str,
+    contexto: str,
+    resposta: str,
+) -> dict:
+    """
+    Avalia se a resposta é fiel ao contexto.
+    Retorna: {"fiel": bool, "score": float, "justificativa": str}
+    """
+    prompt = f"""Avalie se a resposta abaixo é fiel ao contexto fornecido.
+
+<contexto>
+{contexto}
+</contexto>
+
+<pergunta>
+{pergunta}
+</pergunta>
+
+<resposta>
+{resposta}
+</resposta>
+
+Instruções:
+1. Analise se cada afirmação na resposta tem suporte no contexto
+2. Identifique qualquer informação inventada (não presente no contexto)
+3. Dê um score de fidelidade de 0.0 (totalmente infiel) a 1.0 (completamente fiel)
+4. Retorne um JSON com: {{"justificativa": "...", "infiel_claims": [...], "score": 0.0-1.0, "fiel": true|false}}
+
+Scores: 0.9-1.0 = fiel; 0.6-0.9 = parcialmente fiel; <0.6 = infiel"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Você é um avaliador rigoroso de fidelidade de respostas."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=400,
+        response_format={"type": "json_object"},
+    )
+
+    return json.loads(response.choices[0].message.content)
+```
+
+---
+
+## Métricas para pipelines RAG
+
+Em sistemas RAG, avalie os dois componentes separadamente:
+
+| Métrica | Componente | Definição |
+|---|---|---|
+| **Retrieval Precision** | Retrieval | Chunks relevantes recuperados / total chunks recuperados |
+| **Retrieval Recall** | Retrieval | Chunks relevantes recuperados / total chunks relevantes existentes |
+| **Faithfulness** | Geração | A resposta é baseada apenas no contexto? (0–1) |
+| **Answer Relevance** | Geração | A resposta é relevante para a pergunta? (0–1) |
+
+```python
+def medir_precision_retrieval(
+    query: str,
+    chunks_recuperados: list[str],
+    chunks_relevantes: list[str],  # ground truth
+) -> float:
+    """Precision = relevantes no top-k / k."""
+    relevantes_recuperados = set(chunks_recuperados) & set(chunks_relevantes)
+    if not chunks_recuperados:
+        return 0.0
+    return len(relevantes_recuperados) / len(chunks_recuperados)
+
+def medir_recall_retrieval(
+    query: str,
+    chunks_recuperados: list[str],
+    chunks_relevantes: list[str],  # ground truth
+) -> float:
+    """Recall = relevantes no top-k / total relevantes existentes."""
+    if not chunks_relevantes:
+        return 1.0  # sem ground truth, assume recall perfeito
+    relevantes_recuperados = set(chunks_recuperados) & set(chunks_relevantes)
+    return len(relevantes_recuperados) / len(chunks_relevantes)
+```
+
+---
+
+## Prática
+
+**Exercício: avaliação de dois prompts**
+
+Use o prompt de extração ou classificação criado no Módulo 03. Crie dois prompts (v1 e v2 — v2 é uma melhoria ou variação) e compare-os nos mesmos 5 casos de teste.
+
+```python
+import os
+import json
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# ----- Prompt v1 (minimalista) -----
+PROMPT_V1 = """Classifique o ticket de suporte em: urgente, normal ou baixa_prioridade.
+Retorne JSON: {"categoria": "...", "justificativa": "..."}"""
+
+# ----- Prompt v2 (com critérios explícitos e exemplo) -----
+PROMPT_V2 = """Classifique o ticket de suporte em uma das categorias:
+- urgente: cliente sem acesso ao produto ou impacto financeiro imediato
+- normal: problema presente mas com solução alternativa disponível
+- baixa_prioridade: dúvida, sugestão ou feedback sem impacto operacional
+
+Exemplo:
+Ticket: "Meu cartão foi bloqueado e não consigo pagar"
+{"categoria": "urgente", "justificativa": "impacto financeiro imediato"}
+
+Retorne apenas JSON: {"categoria": "urgente|normal|baixa_prioridade", "justificativa": "string"}"""
+
+
+def classificar_v1(texto: str) -> dict:
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": PROMPT_V1},
+            {"role": "user", "content": texto},
+        ],
+        temperature=0.0,
+        max_tokens=150,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(r.choices[0].message.content)
+
+
+def classificar_v2(texto: str) -> dict:
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": PROMPT_V2},
+            {"role": "user", "content": texto},
+        ],
+        temperature=0.0,
+        max_tokens=150,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(r.choices[0].message.content)
+
+
+# ----- 5 casos de teste -----
+CASOS_TICKETS = [
+    TestCase(
+        test_id="test_ticket_payment_blocked",
+        description="Problema de pagamento = urgente",
+        input={"texto": "Meu cartão foi bloqueado e não consigo finalizar minha compra"},
+        expected_output={"categoria": "urgente"},
+        criteria=[EvaluationCriteria(field="categoria", operator="eq", expected="urgente")],
+        tags=["typical", "financial"],
+    ),
+    TestCase(
+        test_id="test_ticket_feature_request",
+        description="Sugestão de funcionalidade = baixa_prioridade",
+        input={"texto": "Seria legal ter modo escuro no aplicativo"},
+        expected_output={"categoria": "baixa_prioridade"},
+        criteria=[EvaluationCriteria(field="categoria", operator="eq", expected="baixa_prioridade")],
+        tags=["typical", "feature_request"],
+    ),
+    TestCase(
+        test_id="test_ticket_login_error",
+        description="Erro de login pode ser urgente dependendo do impacto",
+        input={"texto": "Não consigo fazer login há 2 dias"},
+        expected_output={"categoria": "urgente"},
+        criteria=[EvaluationCriteria(field="categoria", operator="in", expected=["urgente", "normal"])],
+        tags=["edge_case"],
+    ),
+    TestCase(
+        test_id="test_ticket_question",
+        description="Dúvida simples = baixa_prioridade",
+        input={"texto": "Qual é o horário de funcionamento do suporte?"},
+        expected_output={"categoria": "baixa_prioridade"},
+        criteria=[EvaluationCriteria(field="categoria", operator="eq", expected="baixa_prioridade")],
+        tags=["typical", "faq"],
+    ),
+    TestCase(
+        test_id="test_ticket_justificativa_present",
+        description="Resposta sempre deve ter justificativa não vazia",
+        input={"texto": "Algo está errado"},
+        expected_output={},
+        criteria=[
+            EvaluationCriteria(field="categoria", operator="in", expected=["urgente", "normal", "baixa_prioridade"]),
+            EvaluationCriteria(field="justificativa", operator="not_empty", expected=True),
+        ],
+        tags=["schema"],
+    ),
+]
+
+if __name__ == "__main__":
+    comparar_versoes(
+        casos=CASOS_TICKETS,
+        fn_v1=lambda texto: classificar_v1(texto),
+        fn_v2=lambda texto: classificar_v2(texto),
+        versao_v1="v1-minimalista",
+        versao_v2="v2-com-criterios",
+    )
+```
+
+**Critérios de conclusão:**
+- Os 5 casos de teste executam sem erro
+- O relatório mostra taxa de aprovação para cada versão do prompt
+- Ao menos um caso de teste é um edge case ou caso ambíguo
+- A comparação identifica se alguma versão introduz regressões
+
+---
+
+## Resumo
+
+- Em IA, qualidade não quebra com exception — precisa ser **medida ativamente**
+- Critérios objetivos e verificáveis são essenciais — evitar "parece bom"
+- Casos de teste deve cobrir **casos típicos + casos extremos**
+- Use `temperature=0.0` em avaliações para **reprodutibilidade**
+- **LLM-as-judge** é útil para critérios semânticos, mas tem vieses conhecidos — exigir justificativa
+- Em RAG, medir **retrieval e geração separadamente** para diagnosticar corretamente
+- Avaliar é uma prática contínua — toda mudança de prompt precisa reavaliação
+
+### Checklist de avaliação
+
+- [ ] Cada critério de aprovação é verificável por código (sem julgamento subjetivo)?
+- [ ] O conjunto de testes cobre pelo menos um edge case ou caso ambíguo?
+- [ ] As avaliações são executadas com `temperature=0.0`?
+- [ ] O dataset de avaliação está versionado no repositório?
+- [ ] Há comparação quantitativa entre a versão atual e a nova antes de promover?
+- [ ] Para RAG: retrieval e geração são avaliados separadamente?
+- [ ] LLM-as-judge exige justificativa antes do veredito?
 **Status:** `not_started` — conteúdo em construção.
 :::
 

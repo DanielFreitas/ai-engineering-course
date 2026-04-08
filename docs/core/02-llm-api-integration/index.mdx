@@ -1,13 +1,443 @@
 ﻿---
 sidebar_position: 2
-sidebar_label: "Integração com modelos e APIs de IA"
-title: "Integração com modelos e APIs de IA"
+sidebar_label: "Integração com APIs de LLMs"
+title: "Integração com APIs de LLMs"
 description: "Módulo 02 do AI Engineering Course."
 ---
 
-# Integração com modelos e APIs de IA
+# Integração com APIs de LLMs
 
-:::info Status do módulo
+## Objetivo
+
+Ao final deste módulo você consegue fazer chamadas reais a uma API de LLM, configurar os parâmetros corretamente, obter respostas estruturadas em JSON, tratar erros e retentativas, e calcular o custo estimado de uma operação.
+
+> Ampliação de: [Módulo 01 — Fundamentos de Aplicações com IA](../01-ai-fundamentals)
+
+---
+
+## O modelo como componente de software
+
+Chamar um LLM via API é, tecnicamente, uma chamada HTTP POST para um endpoint com um payload JSON. O que diferencia essa integração de uma chamada HTTP comum:
+
+- A resposta tem **latência variável** (1–30 segundos dependendo do modelo e do tamanho)
+- O custo é proporcional ao **número de tokens** na requisição e na resposta
+- A **mesma entrada pode gerar saídas diferentes** (não determinismo)
+- O modelo pode **falhar, truncar ou entregar formato errado**
+
+Por isso, integração com LLM exige os mesmos cuidados de qualquer integração com serviço externo: timeout, retry, validação de saída, e log de métricas.
+
+---
+
+## Anatomia de uma chamada de API
+
+A chamada básica à API da OpenAI tem esta estrutura:
+
+```python
+import os
+import time
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+start = time.monotonic()
+
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[
+        {"role": "system", "content": "Você é um assistente técnico."},
+        {"role": "user", "content": "O que é recursão em programação?"},
+    ],
+    temperature=0.3,
+    max_tokens=500,
+)
+
+latency_ms = int((time.monotonic() - start) * 1000)
+content = response.choices[0].message.content
+usage = response.usage  # prompt_tokens, completion_tokens, total_tokens
+
+print(f"Resposta: {content}")
+print(f"Tokens usados: {usage.total_tokens} | Latência: {latency_ms}ms")
+```
+
+### Os papéis de mensagem
+
+| Role | Função |
+|---|---|
+| `system` | Instrução de comportamento persistente. Contexto global do modelo para essa chamada. |
+| `user` | Entrada do usuário ou do sistema que representa o turno atual. |
+| `assistant` | Resposta anterior do modelo — usado para recriar histórico de conversa. |
+
+**Regra:** nunca misture instruções de sistema no `role: user`. O `system` é para a instrução; o `user` é para a entrada que varia.
+
+---
+
+## Tokens: a unidade de custo e limite
+
+Um **token** é aproximadamente 0,75 palavras em inglês ou 0,6 palavras em português. "Olá, mundo!" são 5 tokens. "Hello, world!" são 4.
+
+O custo de uma chamada é:
+
+$$\text{custo} = (\text{prompt\_tokens} \times \text{preço\_input}) + (\text{completion\_tokens} \times \text{preço\_output})$$
+
+### Janela de contexto
+
+A **janela de contexto** é o limite máximo de tokens que o modelo processa em uma única chamada. Inclui:
+
+- System prompt
+- Histórico de mensagens
+- Documentos recuperados (RAG)
+- A resposta a ser gerada
+
+Se o total ultrapassar o limite, a chamada falha. GPT-4o tem 128k tokens de janela; GPT-4o-mini, também 128k. Mas atenção: **mais contexto = mais custo**.
+
+```python
+# Estimativa de custo para uma operação simples
+PRECO_INPUT_POR_1K = 0.000150   # gpt-4o-mini, em USD (verificar preços atuais)
+PRECO_OUTPUT_POR_1K = 0.000600
+
+def calcular_custo(prompt_tokens: int, completion_tokens: int) -> float:
+    custo_input = (prompt_tokens / 1000) * PRECO_INPUT_POR_1K
+    custo_output = (completion_tokens / 1000) * PRECO_OUTPUT_POR_1K
+    return custo_input + custo_output
+```
+
+> Preços mudam com frequência. Sempre verifique em [platform.openai.com/pricing](https://platform.openai.com/pricing) antes de projetar custos.
+
+---
+
+## Parâmetros de geração
+
+| Parâmetro | Efeito | Recomendação |
+|---|---|---|
+| `temperature` | Variabilidade da saída. 0 = mais determinístico; 2 = mais aleatório. | 0.0–0.2 para extração/classificação; 0.5–0.8 para geração criativa |
+| `max_tokens` | Limite de tokens na resposta. | Sempre definir. Sem limite, respostas longas aumentam custo inesperadamente |
+| `top_p` | Alternativa à temperature via nucleus sampling. | Alterar apenas um entre `temperature` e `top_p` |
+| `frequency_penalty` | Penaliza repetição de tokens já usados. | 0.0–0.5 para textos com tendência a repetir |
+| `presence_penalty` | Incentiva o modelo a introduzir novos tópicos. | Raramente necessário; default = 0 |
+
+---
+
+## Saídas estruturadas
+
+Para extrair dados estruturados do modelo, use o **JSON mode** combinado com instruções explícitas no prompt:
+
+```python
+import json
+from pydantic import BaseModel, Field
+from typing import Literal
+
+class AnaliseTexto(BaseModel):
+    sentimento: Literal["positivo", "negativo", "neutro"]
+    confianca: float = Field(ge=0.0, le=1.0)
+    resumo: str = Field(max_length=300)
+
+def analisar_texto(texto: str) -> AnaliseTexto:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Analise o texto e retorne um JSON com exatamente estes campos:\n"
+                    '- sentimento: "positivo", "negativo" ou "neutro"\n'
+                    "- confianca: número entre 0.0 e 1.0\n"
+                    "- resumo: resumo do texto em no máximo 50 palavras\n"
+                    "Retorne apenas o JSON, sem explicações adicionais."
+                ),
+            },
+            {"role": "user", "content": texto},
+        ],
+        temperature=0.0,
+        max_tokens=300,
+        response_format={"type": "json_object"},  # JSON mode
+    )
+
+    raw = response.choices[0].message.content
+    dados = json.loads(raw)
+    # Validação com Pydantic antes de retornar
+    return AnaliseTexto.model_validate(dados)
+```
+
+**Por que validar com Pydantic?** O JSON mode garante JSON sintaxe válida, mas não garante que os campos estão corretos, com os tipos esperados ou dentro das restrições de valor (ex: `confianca` entre 0 e 1).
+
+---
+
+## Streaming
+
+Quando a resposta pode ser longa, use streaming para enviar chunks progressivamente ao cliente. Isso reduz o tempo até o primeiro token visível (TTFT — Time To First Token).
+
+```python
+def stream_resposta(prompt: str) -> None:
+    stream = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Você é um assistente técnico."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.5,
+        max_tokens=1000,
+        stream=True,  # ativa streaming
+    )
+
+    conteudo_completo = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta is not None:
+            print(delta, end="", flush=True)
+            conteudo_completo += delta
+
+    # Tokens não disponíveis diretamente no stream — use um contador separado se necessário
+    print()  # quebra de linha final
+    return conteudo_completo
+```
+
+> Para streaming do backend para o frontend via SSE, ver: [Módulo 19 — Integração Frontend-Backend](../../frontend/19-frontend-backend-integration)
+
+---
+
+## Tratamento de erros e retentativas
+
+Chamadas de API falham. Os erros mais comuns:
+
+| Erro | Código HTTP | Causa | Tratamento |
+|---|---|---|---|
+| `RateLimitError` | 429 | Muitas requisições por minuto | Retry com backoff exponencial |
+| `APITimeoutError` | — | Chamada excedeu o timeout | Retry (1–2 vezes) |
+| `APIConnectionError` | — | Problema de rede | Retry com backoff |
+| `BadRequestError` | 400 | Prompt inválido ou parâmetros errados | Não fazer retry; corrigir o request |
+| `AuthenticationError` | 401 | API key inválida ou ausente | Não fazer retry; verificar configuração |
+
+Implementação com retry:
+
+```python
+import time
+import logging
+from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
+
+logger = logging.getLogger(__name__)
+
+def chamar_com_retry(
+    client: OpenAI,
+    messages: list[dict],
+    model: str = "gpt-4o-mini",
+    max_tentativas: int = 3,
+    timeout: float = 30.0,
+) -> str:
+    """Chama a API com retentativas em erros transitórios."""
+    erros_com_retry = (RateLimitError, APITimeoutError, APIConnectionError)
+
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+                timeout=timeout,
+            )
+
+            # Verificar se a resposta foi truncada
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason == "length":
+                logger.warning("Resposta truncada por max_tokens. Considere aumentar o limite.")
+
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Modelo retornou resposta vazia.")
+
+            # Logar uso de tokens
+            usage = response.usage
+            logger.info(
+                "LLM call | model=%s | prompt_tokens=%d | completion_tokens=%d | total=%d",
+                model,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            )
+
+            return content
+
+        except erros_com_retry as e:
+            espera = 2 ** tentativa  # backoff exponencial: 2s, 4s, 8s
+            logger.warning(
+                "Tentativa %d/%d falhou (%s). Aguardando %ds.",
+                tentativa,
+                max_tentativas,
+                type(e).__name__,
+                espera,
+            )
+            if tentativa < max_tentativas:
+                time.sleep(espera)
+            else:
+                raise
+
+    raise RuntimeError("Número máximo de tentativas atingido sem sucesso.")
+```
+
+---
+
+## Comparação de provedores
+
+O curso usa OpenAI como referência, mas a lógica de integração é similar para outros provedores:
+
+| Provedor | SDK Python | Compatível com OpenAI SDK? | Notas |
+|---|---|---|---|
+| **OpenAI** | `openai` | — (é o original) | GPT-4o e GPT-4o-mini como modelos de referência |
+| **Anthropic** | `anthropic` | Não | API própria; estrutura de mensagens levemente diferente |
+| **Google Gemini** | `google-generativeai` | Parcial (via `openai` com `base_url`) | Gemini 1.5 Pro tem janela de contexto grande |
+| **Mistral** | `mistral` | Sim (via `base_url`) | Modelos open-source disponíveis |
+
+Para abstrair o provedor e facilitar troca futura:
+
+```python
+# config.py
+import os
+
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL")  # None para OpenAI padrão
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+```
+
+> Separar a chamada de modelo em uma camada de serviço é uma decisão arquitetural do curso (ADR-006 em `.github/architecture-decisions.md`).
+
+---
+
+## Prática
+
+**Exercício: Análise de sentimento com saída estruturada**
+
+Implemente uma função que receba um texto curto e retorne um dicionário com os campos `sentimento`, `confianca` e `resumo`, usando a API de um LLM.
+
+**Requisitos:**
+1. Trabalhar com `gpt-4o-mini` (ou modelo equivalente disponível)
+2. Usar `response_format={"type": "json_object"}` para garantir JSON
+3. Validar a saída com Pydantic antes de retornar
+4. Implementar pelo menos uma retentativa em caso de `RateLimitError`
+5. Logar o número de tokens usados e calcular o custo estimado
+
+```python
+import os
+import json
+import time
+import logging
+from openai import OpenAI, RateLimitError
+from pydantic import BaseModel, Field
+from typing import Literal
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Preços aproximados do gpt-4o-mini (verificar valores atuais)
+PRECO_INPUT_POR_1K_TOKENS = 0.000150
+PRECO_OUTPUT_POR_1K_TOKENS = 0.000600
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+class AnaliseTexto(BaseModel):
+    sentimento: Literal["positivo", "negativo", "neutro"]
+    confianca: float = Field(ge=0.0, le=1.0)
+    resumo: str = Field(max_length=300)
+
+
+def analisar_sentimento(texto: str, max_tentativas: int = 3) -> AnaliseTexto:
+    """
+    Analisa o sentimento de um texto usando LLM.
+    Implementa retentativa simples em caso de RateLimitError.
+    """
+    system_prompt = (
+        "Analise o sentimento do texto fornecido pelo usuário e retorne um JSON com:\n"
+        '- sentimento: "positivo", "negativo" ou "neutro"\n'
+        "- confianca: sua confiança na classificação, entre 0.0 e 1.0\n"
+        "- resumo: resumo em no máximo 50 palavras\n"
+        "Retorne apenas o JSON, sem texto adicional."
+    )
+
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            inicio = time.monotonic()
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": texto},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            )
+
+            latencia_ms = int((time.monotonic() - inicio) * 1000)
+            usage = response.usage
+            custo = (
+                (usage.prompt_tokens / 1000) * PRECO_INPUT_POR_1K_TOKENS
+                + (usage.completion_tokens / 1000) * PRECO_OUTPUT_POR_1K_TOKENS
+            )
+
+            logger.info(
+                "Tokens: prompt=%d | completion=%d | total=%d | custo_usd=%.6f | latencia=%dms",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                custo,
+                latencia_ms,
+            )
+
+            raw = response.choices[0].message.content
+            dados = json.loads(raw)
+            return AnaliseTexto.model_validate(dados)
+
+        except RateLimitError:
+            espera = 2 ** tentativa
+            logger.warning("Rate limit. Tentativa %d/%d. Aguardando %ds.", tentativa, max_tentativas, espera)
+            if tentativa < max_tentativas:
+                time.sleep(espera)
+            else:
+                raise
+
+
+# Critério de validação: executar com textos de exemplo
+if __name__ == "__main__":
+    textos = [
+        "O produto chegou no prazo e estava em perfeitas condições. Recomendo!",
+        "Horrível. O atendimento foi péssimo e meu pedido chegou errado.",
+        "Recebi o produto. Estava embalado.",
+    ]
+
+    for texto in textos:
+        resultado = analisar_sentimento(texto)
+        print(f"Texto: {texto[:50]}...")
+        print(f"Resultado: {resultado.model_dump()}\n")
+```
+
+**Critérios de conclusão:**
+- A função retorna um objeto `AnaliseTexto` válido para os três textos de exemplo
+- O log exibe tokens e custo estimado em USD para cada chamada
+- Se forçar um `RateLimitError` (simulado), o código tenta novamente com backoff
+
+---
+
+## Resumo
+
+- A chamada de API usa `client.chat.completions.create()` com `messages`, `model`, `temperature` e `max_tokens`
+- Os **papéis** `system`, `user`, `assistant` têm funções distintas — nunca misture
+- **Tokens** são a unidade de custo e limite de contexto — sempre monitore e estime antes de produção
+- Use `temperature=0.0` para tarefas de extração e classificação; valores maiores para geração criativa
+- **JSON mode** garante sintaxe JSON válida; **Pydantic** garante o schema correto
+- Implemente **retry com backoff exponencial** para erros transitórios (429, timeout, rede)
+- Sempre **logue tokens, custo e latência** — sem isso, não há como detectar regressão
+
+### Checklist de integração com LLM
+
+- [ ] API key via variável de ambiente, nunca no código
+- [ ] `timeout` explícito em todas as chamadas
+- [ ] `max_tokens` definido para evitar custos inesperados
+- [ ] Saída JSON validada com Pydantic antes de usar
+- [ ] Retry com backoff para erros 429, timeout e conexão
+- [ ] Tokens e custo logados por chamada
+- [ ] Modelo centralizado em constante ou configuração (não hardcoded em múltiplos lugares)
+- [ ] `finish_reason == "length"` verificado e tratado
 **Status:** `not_started` — conteúdo em construção.
 :::
 

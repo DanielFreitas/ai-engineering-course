@@ -7,8 +7,318 @@ description: "Módulo 01 do AI Engineering Course."
 
 # Fundamentos de aplicações com IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue classificar um problema de produto como adequado ou não para IA, descrever os seis padrões principais de aplicações com LLM e esboçar a arquitetura de alto nível de um sistema com IA.
+
+---
+
+## O que mudou quando IA entrou no produto
+
+Por décadas, construir software significou mapear entradas em saídas de forma determinística. Dado o mesmo input, o sistema sempre produz o mesmo output. Testes passam ou falham. Bugs têm causas reproduzíveis.
+
+**AI Engineering** é a disciplina de construir produtos que usam modelos de linguagem como componentes de sistema. O que muda:
+
+| Engenharia tradicional | AI Engineering |
+|---|---|
+| Lógica determinística | Saída probabilística |
+| Bugs têm causa raiz única | Degradação gradual sem erro explícito |
+| Testes passam ou falham | Avaliação é uma distribuição |
+| Custo de CPU/memória | Custo em tokens por requisição |
+| Latência de milissegundos | Latência de 1–10 segundos |
+
+Isso não significa que AI Engineering é melhor ou pior. Significa que exige um conjunto diferente de habilidades, padrões de design e estratégias de operação.
+
+### LLMs como componentes, não como produto
+
+Um **LLM (Large Language Model)** é um modelo de linguagem de grande escala acessado via API. No contexto deste curso, "modelo" significa sempre modelos acessados via API (OpenAI GPT-4o, Anthropic Claude, Google Gemini), não modelos treinados localmente.
+
+O modelo é uma peça de um sistema maior. Ele:
+- Recebe texto como entrada
+- Produz texto como saída
+- Pode falhar, ter latência variável, e gerar respostas fora do esperado
+- Tem custo mensurável por tokens consumidos
+
+A diferença entre "usar a API do ChatGPT" e "construir um sistema com IA" está exatamente no que envolve o modelo: validação de entrada, gestão de contexto, tratamento de erros, avaliação de saída, fallbacks, e observabilidade.
+
+---
+
+## Os 6 padrões de aplicações com LLM
+
+Antes de escolher um modelo ou framework, entender qual padrão seu produto usa. Cada padrão tem requisitos diferentes de custo, arquitetura e avaliação.
+
+### 1. Geração
+
+O modelo recebe uma instrução e produz conteúdo novo: texto, código, resumo, email, descrição de produto.
+
+**Exemplo:** sistema de e-commerce que gera descrições de produtos a partir de atributos técnicos.
+
+```python
+# Entrada: {"nome": "Tênis XR-500", "peso": "280g", "drop": "8mm"}
+# Saída: texto de marketing com os benefícios do produto
+```
+
+**Quando usar:** quando o produto precisa de texto variado, personalizado ou em escala que seria caro produzir manualmente.
+
+**Limitação principal:** a qualidade da saída depende da qualidade da instrução. Saídas não são garantidamente corretas.
+
+---
+
+### 2. Classificação
+
+O modelo lê um texto e atribui uma categoria. Alternativa aos modelos de classificação tradicionais (BERT, etc.) para casos onde as categorias são semânticas e complexas.
+
+**Exemplo:** sistema de suporte que classifica tickets entre `urgente`, `normal` e `baixa_prioridade` com base no texto livre do usuário.
+
+```python
+# Entrada: "Meu cartão foi bloqueado e não consigo pagar minha conta"
+# Saída: "urgente"
+```
+
+**Quando usar:** categorias semânticas que seriam difíceis de capturar com regex ou palavras-chave; quando há variabilidade alta na linguagem do usuário.
+
+**Limitação principal:** para dados estruturados com regras claras, um classificador simples é mais rápido, barato e confiável.
+
+---
+
+### 3. Extração
+
+O modelo lê um texto não estruturado e extrai informações estruturadas.
+
+**Exemplo:** sistema que lê emails de pedido em formato livre e extrai campos como nome do cliente, produto, quantidade e endereço.
+
+```python
+# Entrada: "Oi, quero 3 caixas do produto B para Rua das Flores, 123, SP"
+# Saída: {"produto": "B", "quantidade": 3, "endereco": "Rua das Flores, 123, SP"}
+```
+
+**Quando usar:** dados chegam em texto livre (emails, formulários descritivos, documentos legados) e precisam alimentar sistemas estruturados.
+
+**Limitação principal:** o modelo pode inventar campos que não existem no texto. Validação de saída é obrigatória.
+
+---
+
+### 4. Transformação
+
+O modelo recebe texto em um formato e produz no outro: tradução, reformatação, simplificação, conversão de tom.
+
+**Exemplo:** sistema que converte notas técnicas de médico em linguagem acessível para o paciente.
+
+```python
+# Entrada: "Paciente apresenta quadro de hipertensão arterial sistêmica leve"
+# Saída: "Seus resultados indicam pressão arterial um pouco acima do ideal"
+```
+
+**Quando usar:** quando a transformação é semântica (não apenas sintática) e o volume é alto demais para fazer manualmente.
+
+**Limitação principal:** traduções e transformações de alta responsabilidade (documentos jurídicos, médicos) exigem revisão humana.
+
+---
+
+### 5. Assistente (Chatbot / Copilot)
+
+O modelo mantém uma conversa com múltiplos turnos, respondendo perguntas, ajudando em tarefas ou guiando o usuário.
+
+**Exemplo:** assistente de codificação que responde dúvidas sobre a base de código, sugere correções e explica erros de compilação.
+
+**Quando usar:** quando o produto beneficia de interação conversacional e quando o escopo de perguntas é amplo demais para ser coberto por uma FAQ.
+
+**Limitação principal:** o modelo não tem memória persistente entre sessões por padrão. O histórico precisa ser gerenciado explicitamente pelo sistema.
+
+> Ver: [Módulo 09 — Contexto, Memória e Estado](../../backend/09-context-memory-state)
+
+---
+
+### 6. RAG (Retrieval-Augmented Generation)
+
+O modelo responde perguntas usando informações recuperadas de uma base de conhecimento externa, em vez de depender apenas do conhecimento que adquiriu no treinamento.
+
+**RAG (Retrieval-Augmented Generation)** é o padrão arquitetural que combina busca com geração: primeiro recupera os trechos relevantes de documentos, depois passa esses trechos como contexto para o modelo gerar a resposta.
+
+**Exemplo:** chatbot que responde perguntas sobre o manual do produto usando o PDF do manual como base de conhecimento.
+
+```
+Usuário: "Como resetar a senha?"
+Sistema:
+  1. Busca trechos relevantes do manual sobre "reset senha"
+  2. Passa esses trechos ao modelo como contexto
+  3. Modelo gera resposta baseada no contexto fornecido
+```
+
+**Quando usar:** quando o produto precisa responder com informações específicas e atualizadas que o modelo não tem no treinamento (documentação interna, produtos, políticas da empresa).
+
+**Limitação principal:** a qualidade da resposta depende da qualidade da recuperação. Se o trecho errado for recuperado, a resposta será errada.
+
+> Ver: [Módulo 04 — Embeddings e RAG](../04-embeddings-rag)
+
+---
+
+## Capacidades reais dos LLMs
+
+LLMs são excelentes em tarefas onde:
+
+- **Linguagem natural é ambígua:** entender intenção por trás de uma frase mal formulada
+- **Variabilidade de forma:** múltiplas formas de dizer a mesma coisa com o mesmo significado
+- **Raciocínio de linguagem:** inferir contexto implícito, resumir, comparar conceitos
+- **Geração criativamente controlada:** produzir texto que segue um padrão com variações
+
+LLMs não são adequados para:
+
+- **Cálculos numéricos precisos:** o modelo pode errar aritmeticamente; use uma calculadora
+- **Dados em tempo real:** o modelo não tem acesso à internet por padrão; é treinado em dados com data de corte
+- **Operações determinísticas críticas:** se o resultado precisa ser sempre o mesmo, use código
+- **Dados estruturados com schema fixo:** parsing de JSON bem definido, regex, parsers dedicados são mais rápidos e confiáveis
+
+---
+
+## Limitações que impactam engenharia
+
+### Não determinismo
+
+A mesma entrada pode gerar saídas diferentes em chamadas diferentes. Isso não é um bug — é uma característica probabilística. O parâmetro `temperature` controla a variabilidade, mas `temperature=0` reduz sem eliminar a variação.
+
+**Impacto prático:**
+- Testes baseados em "a saída é exatamente X" falham
+- Avaliação do sistema precisa ser estatística, não binária
+- UX precisa comunicar que respostas podem variar
+
+### Alucinação
+
+**Alucinação** é a geração de conteúdo factualmente incorreto, inventado ou impossível de verificar. O modelo produz texto fluente e confiante mesmo quando está errado.
+
+**Impacto prático:**
+- Nunca apresentar saída de LLM como fato sem validação
+- Para domínios críticos (saúde, jurídico, financeiro), revisão humana é obrigatória
+- RAG e grounding reduzem alucinações mas não as eliminam
+
+### Custo em tokens
+
+Toda chamada a um modelo tem custo. A unidade é **tokens** (aproximadamente 0,75 palavras em inglês, ~0,6 palavras em português). O custo de uma feature depende de:
+
+- Tamanho do system prompt
+- Tamanho do histórico de conversa passado ao modelo
+- Tamanho da resposta gerada
+- Volume de requisições × frequência de uso
+
+**Impacto prático:** estimar o custo antes de construir. Um system prompt de 2.000 tokens × 10.000 usuários × 5 mensagens/dia é um número mensurável e planejável.
+
+### Latência de inferência
+
+**Latência de inferência** é o tempo entre enviar a requisição e receber a resposta. Para modelos grandes, esse valor é tipicamente de 1 a 10 segundos para respostas completas.
+
+**Impacto prático:**
+- UX nunca pode bloquear o usuário aguardando resposta — streaming é essencial
+- Operações síncronas com timeout curto não funcionam com LLMs
+
+### Janela de contexto
+
+A **janela de contexto** (context window) é a quantidade máxima de tokens que o modelo pode processar em uma única chamada. Inclui: system prompt + histórico + documentos recuperados + resposta gerada.
+
+**Impacto prático:**
+- Histórico de conversa longo precisa ser truncado ou sumarizado
+- Documentos grandes não cabem inteiros — chunking é necessário para RAG
+- O custo aumenta linearmente com o tamanho do contexto
+
+---
+
+## Trade-offs e decisões de projeto
+
+Toda decisão de usar IA envolve um trade-off. Os principais:
+
+| Trade-off | Quando usar IA | Quando não usar |
+|---|---|---|
+| Determinismo vs. flexibilidade | Problema semântico, linguagem variável | Regra fixa, lógica determinística |
+| Custo vs. escala | Volume alto, geração manual impossível | Volume baixo, solução mais barata existe |
+| Velocidade vs. qualidade | Pode usar streaming, usuário aguarda | Resposta precisa ser imediata (`<200ms`) |
+| Controle vs. capacidade | Problema bem definido, output validável | Problema mal definido, output crítico e não verificável |
+
+### Critério de decisão: quando usar IA?
+
+Antes de adicionar IA a uma feature, responder:
+
+1. O problema é semântico? (linguagem, intenção, conteúdo) Se não → talvez não precise de LLM
+2. O output pode ser validado? Se não → adicionar validação antes de usar em produção
+3. O custo por requisição é aceitável no volume esperado? Se não → buscar alternativa ou reduzir o prompt
+4. O usuário tolera 2–5 segundos de espera? Se não → o design precisa usar streaming ou processamento assíncrono
+
+---
+
+## Arquitetura de alto nível
+
+Uma aplicação com IA segue este padrão fundamental:
+
+```
+┌─────────────┐    requisição    ┌─────────────────┐    chamada de API    ┌──────────────┐
+│   Frontend  │ ───────────────► │     Backend     │ ──────────────────► │    Modelo    │
+│  (React)    │ ◄─────────────── │   (FastAPI)     │ ◄────────────────── │  (GPT-4o)    │
+└─────────────┘    resposta      └────────┬────────┘    resposta          └──────────────┘
+                                          │
+                                          │ lê/escreve
+                                          ▼
+                                 ┌─────────────────┐
+                                 │  Contexto /     │
+                                 │  Base de dados  │
+                                 └─────────────────┘
+```
+
+- **Frontend:** apresenta a interface, gerencia streaming, comunica estado ao usuário
+- **Backend:** orquestra o fluxo, monta o contexto, valida entrada e saída, gerencia erros  
+- **Modelo:** recebe o prompt, gera a resposta — não tem estado próprio entre chamadas
+- **Contexto/Base de dados:** histórico de conversa, documentos para RAG, estado da sessão
+
+O modelo é stateless por padrão. Todo estado relevante precisa ser passado explicitamente em cada chamada.
+
+> Este diagrama será expandido em: [Módulo 07 — Arquitetura de Sistemas com IA](../07-ai-architecture)
+
+---
+
+## Prática
+
+**Exercício: Análise de adequação de IA**
+
+Para cada uma das 5 ideias de produto abaixo, responda:
+- **Precisa de IA?** Sim / Não / Talvez
+- **Se sim:** qual padrão? (geração, classificação, extração, transformação, assistente, RAG)
+- **Se não:** por que o problema é melhor resolvido sem IA?
+
+| # | Ideia de produto |
+|---|---|
+| 1 | Sistema que envia email de boas-vindas quando um usuário se cadastra |
+| 2 | Ferramenta que resume documentos longos de contrato em bullet points |
+| 3 | Calculadora de juros compostos |
+| 4 | Chatbot que responde perguntas sobre o manual do produto usando o PDF do manual |
+| 5 | Sistema que classifica tickets de suporte entre "urgente", "normal" e "baixa prioridade" com base no texto do ticket |
+
+**Critério de conclusão:** justificativa clara para cada decisão, usando pelo menos um conceito do módulo (limitação, padrão, custo/benefício).
+
+<details>
+<summary>Referência de respostas (abra após tentar)</summary>
+
+| # | Precisa de IA? | Padrão / Justificativa |
+|---|---|---|
+| 1 | **Não** | Email de boas-vindas é determinístico. Um template com merge tags resolve com zero custo e zero latência extra. Usar LLM aqui é o anti-padrão AP01. |
+| 2 | **Sim** | Padrão: **transformação**. Resumo de texto longo é uma tarefa semântica onde o modelo é excelente. Validar que o resumo não inventou informações não presentes no contrato. |
+| 3 | **Não** | Cálculo matemático exato. LLMs cometem erros em aritmética. Código é mais confiável, mais rápido e gratuito para esse caso. |
+| 4 | **Sim** | Padrão: **RAG**. O chatbot precisa de informações específicas do manual (não está no treinamento do modelo). Recuperar trechos relevantes e passá-los como contexto é a abordagem correta. |
+| 5 | **Sim** | Padrão: **classificação**. Tickets têm linguagem variável e semântica rica. Um modelo é eficaz aqui. Alternativa: modelo de ML treinado em dados históricos, se houver volume suficiente de exemplos rotulados. |
+
+</details>
+
+---
+
+## Resumo
+
+- **AI Engineering** é construir sistemas onde LLMs são componentes — não usar IA como produto
+- LLMs são componentes stateless, probabilísticos, com custo por token e latência relevante
+- Os **6 padrões** cobrem a maioria dos casos de uso: geração, classificação, extração, transformação, assistente, RAG
+- As **5 limitações** que todo engenheiro deve conhecer: não determinismo, alucinação, custo em tokens, latência de inferência, janela de contexto
+- A arquitetura básica: frontend → backend → modelo, com estado gerenciado explicitamente pelo sistema
+
+### Checklist: quando usar IA
+
+- [ ] O problema é semântico ou envolve linguagem natural com variabilidade alta?
+- [ ] Uma solução determinística simples não resolve melhor e mais barato?
+- [ ] O custo por requisição em tokens é aceitável no volume esperado?
+- [ ] O sistema tem mecanismo de validação de saída?
+- [ ] O design acomoda latência de 1–10 segundos (streaming ou async)?
+- [ ] Existe um fallback para quando o modelo falhar ou entregar output inválido?
