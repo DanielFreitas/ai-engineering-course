@@ -1,41 +1,66 @@
-# Website
+# AI Engineering Course
 
-This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.
+> **Do fundamento à operação** — LLMs, backend e frontend com IA em produção.
 
-## Installation
+Curso prático em português com 20 módulos progressivos cobrindo toda a stack necessária para construir e operar sistemas de IA reais: da integração com LLMs ao LLMOps, passando por FastAPI, pgvector, Redis, OpenTelemetry e React.
 
-```bash
-yarn
-```
+🌐 **[danielfreitas.github.io/ai-engineering-course](https://danielfreitas.github.io/ai-engineering-course/)**
 
-## Local Development
+---
 
-```bash
-yarn start
-```
+## Trilhas
 
-This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
+| # | Trilha | Módulos |
+|---|--------|---------|
+| 🧠 | **Núcleo** | 01 AI Fundamentals · 02 LLM API Integration · 03 Prompt Engineering · 04 Embeddings & RAG · 05 LLM Evaluation · 06 AI Safety & Governance · 07 AI Architecture |
+| ⚙️ | **Backend** | 08 FastAPI AI Backend · 09 Context & Memory · 10 Tool Calling · 11 Persistence · 12 Pub/Sub Async · 13 Redis Performance · 14 OTel + Datadog · 15 LLMOps · 16 Operational Security |
+| 🖥️ | **Frontend** | 17 React AI Frontend · 18 AI UX Quality · 19 Frontend Integration · 20 Experience Telemetry |
 
-## Build
+## Stack
 
-```bash
-yarn build
-```
+`Python 3.11+` `FastAPI` `Pydantic v2` `OpenAI GPT-4o` `pgvector` `Redis` `OpenTelemetry` `Datadog` `GCP Pub/Sub` `React` `TypeScript` `SSE`
 
-This command generates static content into the `build` directory and can be served using any static contents hosting service.
+---
 
-## Deployment
+## Desenvolvimento local
 
-Using SSH:
+**Pré-requisito:** Node.js 20+
 
 ```bash
-USE_SSH=true yarn deploy
+npm install
+npm start        # http://localhost:3000 com hot reload
 ```
-
-Not using SSH:
 
 ```bash
-GIT_USER=<Your GitHub username> yarn deploy
+npm run build    # build de produção → ./build
+npm run serve    # preview do build local
+npm run typecheck
 ```
 
-If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+## CI/CD
+
+| Evento | Workflow | Ação |
+|--------|----------|------|
+| Push em `master` | `deploy.yml` | Build + deploy no GitHub Pages |
+| Pull request para `master` | `ci.yml` | Typecheck + build (validação) |
+
+Os workflows ficam em [`.github/workflows/`](.github/workflows/).
+
+## Estrutura
+
+```
+docs/
+  core/        # módulos 01-07
+  backend/     # módulos 08-16
+  frontend/    # módulos 17-20
+src/
+  pages/       # homepage
+  css/         # tema global
+.github/
+  skills/      # contratos de qualidade por módulo
+  workflows/   # GitHub Actions
+```
+
+## Licença
+
+MIT
