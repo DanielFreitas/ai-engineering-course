@@ -2,13 +2,314 @@
 sidebar_position: 3
 sidebar_label: "Tool calling e orquestração"
 title: "Tool calling e orquestração"
-description: "Módulo 10 do AI Engineering Course."
+description: "Como implementar function/tool calling com LLMs — schemas de ferramentas, ciclo de execução, orquestração e tratamento de erros."
 ---
 
 # Tool calling e orquestração
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue criar uma ferramenta (função Python), registrá-la no schema correto para o LLM, executar o ciclo completo de tool calling e tratar erros — incluindo limite de iterações para prevenir loops.
+
+---
+
+## O que o modelo não consegue fazer sozinho
+
+Um LLM gera texto. Ele não consulta bancos de dados, não chama APIs externas, não executa código em tempo real. O que ele consegue fazer é **declarar a intenção** de usar uma ferramenta.
+
+**Function calling** (ou **tool calling**) é o mecanismo pelo qual o modelo indica que quer usar uma função externa, com quais parâmetros. O sistema host recebe essa intenção, executa a função real e devolve o resultado ao modelo para que ele formule a resposta final.
+
+```
+Usuário: "Qual o status do pedido #12345?"
+              ↓
+         [Modelo analisa]
+              ↓
+         Modelo declara: chamar get_order_status(order_id="#12345")
+              ↓
+         Sistema executa a função Python
+              ↓
+         Resultado: {"status": "Em trânsito", "previsão": "amanhã"}
+              ↓
+         Modelo formula: "Seu pedido #12345 está em trânsito..."
+```
+
+O modelo nunca executou nada — ele apenas estruturou uma chamada. Quem executou foi o seu código.
+
+> Ver: [O que é agente neste curso](../../core/07-ai-architecture) — tool calling é o bloco fundamental de agentes.
+
+---
+
+## Anatomia de um schema de ferramenta
+
+O modelo recebe a lista de ferramentas disponíveis como JSON Schema. Cada ferramenta tem:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_order_status",
+    "description": "Consulta o status atual de um pedido pelo ID. Use quando o usuário perguntar sobre status, localização ou prazo de entrega.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "description": "Identificador do pedido (ex: '#12345' ou 'ORD-2024-001')"
+        }
+      },
+      "required": ["order_id"]
+    }
+  }
+}
+```
+
+A `description` é crítica — é ela que guia o modelo a decidir **quando** usar a ferramenta. Descrições vagas levam a chamadas erradas ou ausentes.
+
+---
+
+## O ciclo completo de tool calling
+
+```
+1. Envia mensagem + lista de ferramentas ao modelo
+2. Modelo retorna: { "tool_calls": [{ "function": { "name": "get_order_status", "arguments": "{\"order_id\": \"#12345\"}" } }] }
+3. Sistema executa get_order_status("#12345")
+4. Sistema devolve resultado ao modelo como mensagem com role "tool"
+5. Modelo gera resposta final em texto
+```
+
+O modelo pode solicitar múltiplas ferramentas em uma única resposta. E pode precisar de mais de uma rodada (iteração) para concluir.
+
+---
+
+## Implementação
+
+### Definindo a ferramenta
+
+```python
+# tools/order_tools.py
+import json
+from typing import Any
+
+# Simulação de banco de dados de pedidos
+_ORDERS_DB = {
+    "#12345": {"status": "Em trânsito", "previsao": "Amanhã até 18h", "carrier": "Correios"},
+    "#99999": {"status": "Entregue", "previsao": None, "carrier": "Jadlog"},
+}
+
+def get_order_status(order_id: str) -> dict[str, Any]:
+    """Implementação real da ferramenta (não vista pelo modelo)."""
+    # Remove prefixo opcional
+    clean_id = order_id.replace("#", "").strip()
+    order = _ORDERS_DB.get(f"#{clean_id}")
+    if not order:
+        return {"error": f"Pedido {order_id} não encontrado."}
+    return order
+
+# Schema que o modelo recebe
+ORDER_STATUS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_order_status",
+        "description": "Consulta o status atual de um pedido pelo ID. Use quando o usuário perguntar sobre status, localização ou prazo de entrega de um pedido.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "Identificador único do pedido (ex: '#12345')",
+                }
+            },
+            "required": ["order_id"],
+        },
+    },
+}
+
+# Mapa nome → função (para execução)
+TOOL_REGISTRY: dict[str, callable] = {
+    "get_order_status": get_order_status,
+}
+```
+
+### Orquestrador
+
+```python
+# services/tool_orchestrator.py
+import json
+import time
+import logging
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+MAX_ITERATIONS = 5  # previne loops infinitos
+
+async def run_with_tools(
+    user_message: str,
+    system_prompt: str,
+    tools: list[dict],
+    tool_registry: dict,
+    client: AsyncOpenAI,
+    model: str = "gpt-4o",
+) -> str:
+    """
+    Executa o ciclo de tool calling até o modelo retornar
+    uma resposta final (sem mais tool calls) ou atingir MAX_ITERATIONS.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+    for iteration in range(MAX_ITERATIONS):
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",  # modelo decide quando usar ferramenta
+        )
+
+        choice = response.choices[0]
+
+        # Modelo respondeu sem tool call — terminamos
+        if choice.finish_reason == "stop":
+            return choice.message.content
+
+        # Modelo solicitou tool calls
+        if choice.finish_reason == "tool_calls":
+            # Adiciona a mensagem do assistente com as tool calls
+            messages.append(choice.message)
+
+            # Executa cada ferramenta solicitada
+            for tool_call in choice.message.tool_calls:
+                tool_name = tool_call.function.name
+                raw_args = tool_call.function.arguments
+
+                # Valida e parseia os argumentos
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    result = {"error": "Parâmetros inválidos gerados pelo modelo."}
+                    args = {}
+                else:
+                    # Executa a função se registrada
+                    if tool_name in tool_registry:
+                        start = time.monotonic()
+                        try:
+                            result = tool_registry[tool_name](**args)
+                        except Exception as e:
+                            result = {"error": str(e)}
+                        latency = int((time.monotonic() - start) * 1000)
+
+                        logger.info(
+                            "tool_call",
+                            extra={
+                                "tool": tool_name,
+                                "args": args,
+                                "result": result,
+                                "latency_ms": latency,
+                                "iteration": iteration,
+                            },
+                        )
+                    else:
+                        result = {"error": f"Ferramenta '{tool_name}' não registrada."}
+
+                # Devolve resultado ao modelo
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+
+    # Atingiu o limite de iterações
+    logger.warning("tool_calling_max_iterations_reached", extra={"limit": MAX_ITERATIONS})
+    return "Não consegui concluir a operação dentro do número máximo de etapas."
+```
+
+---
+
+## Orquestração: além da chamada única
+
+### Chamadas paralelas
+
+O modelo pode solicitar múltiplas ferramentas simultaneamente (quando as chamadas são independentes). O loop acima já suporta isso — ele itera sobre `choice.message.tool_calls`, que pode conter mais de um item.
+
+### Chamadas condicionais
+
+A lógica condicional pode estar no prompt (instrução de quando usar cada ferramenta) ou no código do orquestrador (verificar resultado antes de prosseguir):
+
+```python
+# Após executar get_order_status, decidir se precisa de mais informação
+if "error" in result:
+    # Ferramenta falhou — informar o modelo
+    messages.append({"role": "tool", "tool_call_id": tc_id,
+                      "content": json.dumps(result)})
+else:
+    # Sucesso — continuar normalmente
+    ...
+```
+
+---
+
+## Tratamento de erros em ferramentas
+
+Erros de ferramenta não devem interromper o fluxo — devem ser comunicados ao modelo para que ele decida como proceder:
+
+| Tipo de erro | Resposta recomendada |
+|---|---|
+| Parâmetro inválido | `{"error": "order_id inválido"}` — modelo pode corrigir |
+| Recurso não encontrado | `{"error": "Pedido não encontrado"}` — modelo informa usuário |
+| Falha de serviço externo | `{"error": "Serviço indisponível temporariamente"}` — modelo escala |
+| Erro de implementação | Logar, retornar erro genérico, não expor stack trace |
+
+---
+
+## Quando usar tool calling manual vs. framework
+
+| Cenário | Recomendação |
+|---|---|
+| 1-5 ferramentas simples, fluxo previsível | Manual (como neste módulo) |
+| Loop de agente complexo, memória, múltiplos modelos | Framework (LangChain, LlamaIndex) |
+| Produção com requisitos de observabilidade | Manual + instrumentação própria |
+| Prototipagem rápida | Framework para velocidade inicial |
+
+Para produção, a implementação manual oferece mais controle sobre erros, custos e instrumentação.
+
+> Ver: [Segurança Operacional](../16-operational-security) para controles de segurança em tool calling.
+
+---
+
+## Prática
+
+**Exercício:** Crie uma ferramenta `get_order_status(order_id: str) -> dict` que simula consulta de pedidos. Registre-a e execute a pergunta "Qual o status do pedido #12345?".
+
+**Passo a passo:**
+
+1. Implemente `get_order_status` com um dicionário estático de pedidos
+2. Defina o schema JSON da ferramenta seguindo o formato OpenAI
+3. Implemente o loop de orquestração com `MAX_ITERATIONS = 5`
+4. Faça a chamada com a pergunta do exercício
+5. Valide que o modelo usou a ferramenta e que a resposta final usa o resultado
+
+**Critérios de validação:**
+- O schema da ferramenta descreve `order_id` com tipo e descrição
+- O modelo chama `get_order_status` com `order_id="#12345"` (ou equivalente)
+- O resultado da ferramenta aparece na resposta final do modelo
+- O loop termina normalmente (não por limite de iterações)
+- Cada chamada de ferramenta é logada com `tool_name`, `args` e `result`
+
+---
+
+## Checklist de qualidade
+
+- [ ] Schemas de ferramentas têm descrições claras para todos os parâmetros
+- [ ] Existe limite máximo de iterações configurado (`MAX_ITERATIONS`)
+- [ ] Parâmetros gerados pelo modelo são validados antes da execução
+- [ ] Resultados de ferramentas são resumidos se muito longos
+- [ ] Cada chamada de ferramenta é logada com parâmetros e resultado
+- [ ] Erros de ferramenta são retornados ao modelo, não propagados como exceções
+
+---
+
+> Ampliação de: [Integração com a API do LLM](../../core/02-llm-api-integration)
+
+> Próximo módulo: [Persistência de Contexto e Histórico](../11-persistence-context)

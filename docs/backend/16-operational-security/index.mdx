@@ -1,14 +1,331 @@
 ﻿---
 sidebar_position: 9
 sidebar_label: "Segurança operacional para aplicações com IA"
-title: "Segurança operacional para aplicações com IA"
-description: "Módulo 16 do AI Engineering Course."
+title: "Segurança operacional de IA"
+description: "Controles de segurança mínimos para endpoints de IA em produção — modelo de ameaça, rate limiting, proteção de contexto, audit log e resposta a incidentes."
 ---
 
-# Segurança operacional para aplicações com IA
+# Segurança operacional de IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue listar os controles de segurança mínimos para um endpoint de IA com acesso a ferramentas internas — e implementar pelo menos dois deles (rate limiting e audit log).
+
+---
+
+## Por que IA em produção tem riscos únicos
+
+Um endpoint de backend tradicional tem superfície de ataque previsível: injeção SQL, overflow de input, autenticação inadequada. Um endpoint de IA tem esses mesmos vetores **mais** riscos adicionais:
+
+- **Prompt injection:** usuário insere instrução maliciosa para subverter o comportamento do modelo
+- **Extração de contexto:** o modelo pode ser induzido a revelar dados de outros usuários presentes no contexto
+- **Abuso de tool calling:** o modelo pode ser manipulado a executar ações não intencionadas via ferramentas
+- **Custo como vetor de ataque:** um único usuário pode gerar centenas de requisições caras
+
+> Ver: [Segurança e Governança de IA](../../core/06-ai-safety-governance) para a perspectiva de princípios. Este módulo trata da implementação operacional.
+
+---
+
+## Modelo de ameaça simplificado
+
+Para cada endpoint de IA, aplique as três perguntas:
+
+| Pergunta | O que analisar |
+|---|---|
+| **Quem pode atacar?** | Usuários não autenticados, usuários autenticados mal-intencionados, automação (bots) |
+| **Como podem atacar?** | Prompt injection, volume anômalo, parâmetros maliciosos em tool calls |
+| **Qual o impacto?** | Custo financeiro, vazamento de dados, degradação do serviço |
+
+---
+
+## Controle 1: Rate limiting em múltiplas camadas
+
+```python
+# security/rate_limiter.py
+import time
+from redis.asyncio import Redis
+from fastapi import HTTPException, Request
+
+class RateLimiter:
+    def __init__(self, redis: Redis):
+        self._redis = redis
+
+    async def check(
+        self,
+        key: str,
+        limit: int,
+        window_seconds: int,
+    ) -> None:
+        """
+        Sliding window counter. Lança 429 se o limite for excedido.
+        """
+        redis_key = f"ai:ratelimit:{key}:{int(time.time() // window_seconds)}"
+        count = await self._redis.incr(redis_key)
+        if count == 1:
+            await self._redis.expire(redis_key, window_seconds * 2)
+        if count > limit:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "RATE_LIMIT_EXCEEDED",
+                        "message": "Limite de requisições atingido. Tente novamente em breve."}
+            )
+
+# Uso no router — múltiplas camadas
+async def rate_limit_ai_endpoint(request: Request, redis: Redis, user_id: str) -> None:
+    limiter = RateLimiter(redis)
+    # Por IP: 100 req/hora
+    await limiter.check(f"ip:{request.client.host}", limit=100, window_seconds=3600)
+    # Por usuário: 30 req/hora
+    await limiter.check(f"user:{user_id}", limit=30, window_seconds=3600)
+    # Por usuário por minuto: burst protection
+    await limiter.check(f"user_burst:{user_id}", limit=5, window_seconds=60)
+```
+
+---
+
+## Controle 2: Validação e sanitização de entrada
+
+```python
+# security/input_validator.py
+import re
+from pydantic import BaseModel, Field, validator
+
+# Padrões conhecidos de prompt injection
+_INJECTION_PATTERNS = [
+    r"ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions",
+    r"forget\s+(?:all\s+)?(?:previous|your)\s+instructions",
+    r"you\s+are\s+now\s+(?:a|an)\s+",
+    r"system\s*prompt\s*:",
+    r"<\s*/?(?:system|user|assistant)\s*>",
+]
+
+class AIEndpointInput(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+    user_id: str
+
+    @validator("text")
+    def check_prompt_injection(cls, v: str) -> str:
+        text_lower = v.lower()
+        for pattern in _INJECTION_PATTERNS:
+            if re.search(pattern, text_lower):
+                raise ValueError("Input contém padrão não permitido.")
+        return v
+
+    @validator("text")
+    def normalize_encoding(cls, v: str) -> str:
+        """Normaliza para UTF-8 e remove caracteres de controle."""
+        return v.encode("utf-8", errors="replace").decode("utf-8")
+```
+
+---
+
+## Controle 3: Proteção de contexto
+
+Dados sensíveis nunca entram no prompt enviado ao provedor externo:
+
+```python
+# security/context_sanitizer.py
+import re
+
+class ContextSanitizer:
+    _SENSITIVE_PATTERNS = [
+        (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]"),
+        (r"\b\d{11}\b", "[CPF]"),              # CPF brasileiro
+        (r"\b4[0-9]{12}(?:[0-9]{3})?\b", "[CARD]"),  # Visa
+        (r"sk-[a-zA-Z0-9]{48}", "[API_KEY]"),  # OpenAI API key
+    ]
+
+    def sanitize(self, text: str) -> str:
+        """Remove dados sensíveis antes de enviar ao modelo."""
+        for pattern, replacement in self._SENSITIVE_PATTERNS:
+            text = re.sub(pattern, replacement, text)
+        return text
+```
+
+---
+
+## Controle 4: Permissões de tool calling
+
+```python
+# security/tool_permissions.py
+from fastapi import HTTPException
+
+class ToolPermissionManager:
+    """Verifica se o usuário pode invocar uma ferramenta específica."""
+
+    # Mapeamento role → ferramentas permitidas
+    _PERMISSIONS = {
+        "customer": ["get_order_status", "get_product_info"],
+        "support_agent": ["get_order_status", "get_product_info", "update_ticket"],
+        "admin": ["get_order_status", "get_product_info", "update_ticket", "refund_order"],
+    }
+
+    def check_tool_permission(self, user_role: str, tool_name: str) -> None:
+        """Lança 403 se o usuário não tem permissão para a ferramenta."""
+        allowed = self._PERMISSIONS.get(user_role, [])
+        if tool_name not in allowed:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "TOOL_PERMISSION_DENIED",
+                        "message": f"Acesso à ferramenta '{tool_name}' não autorizado."}
+            )
+```
+
+---
+
+## Controle 5: Audit log imutável
+
+```python
+# security/audit_logger.py
+import json
+import logging
+from datetime import datetime, timezone
+import hashlib
+
+_audit_logger = logging.getLogger("audit")
+
+def log_tool_invocation(
+    user_id: str,
+    session_id: str,
+    tool_name: str,
+    parameters: dict,
+    outcome: str,
+    error_code: str | None = None,
+) -> None:
+    """
+    Registra invocação de ferramenta em log de auditoria.
+    Parâmetros são sanitizados antes do registro.
+    """
+    # Sanitiza parâmetros — remove chaves sensíveis
+    safe_params = {
+        k: v for k, v in parameters.items()
+        if k not in {"password", "token", "secret", "api_key"}
+    }
+
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": "tool_invocation",
+        "actor": {
+            "user_id": hashlib.sha256(user_id.encode()).hexdigest()[:16],
+            "session_id": session_id,
+        },
+        "resource": {"type": "tool", "name": tool_name},
+        "action": {
+            "name": tool_name,
+            "parameters": safe_params,
+            "outcome": outcome,
+            "error_code": error_code,
+        },
+    }
+
+    _audit_logger.info(json.dumps(event))
+```
+
+---
+
+## Controle 6: Monitoramento de abuso
+
+```python
+# security/abuse_monitor.py
+
+class AbuseMonitor:
+    def __init__(self, redis):
+        self._redis = redis
+
+    async def record_and_check(self, user_id: str, request_tokens: int) -> None:
+        """Detecta padrões anômalos de uso."""
+        key = f"ai:abuse:tokens:{user_id}"
+        total = await self._redis.incrby(key, request_tokens)
+        if total == request_tokens:
+            await self._redis.expire(key, 3600)  # janela de 1 hora
+
+        # Threshold: 100k tokens/hora por usuário
+        if total > 100_000:
+            await self._flag_for_review(user_id, total)
+
+    async def _flag_for_review(self, user_id: str, tokens_used: int) -> None:
+        # Em produção: notificar canal #ai-security via webhook
+        import logging
+        logging.getLogger("security").warning(
+            "abuse_detected",
+            extra={"user_id": user_id[:8], "tokens_1h": tokens_used}
+        )
+```
+
+---
+
+## Checklist de controles mínimos
+
+| Controle | O que protege | Como validar |
+|---|---|---|
+| Rate limiting por IP e por usuário | Abuso de volume | Testar com burst de 6 req/min |
+| Validação de entrada (injection) | Prompt injection | Testar com "ignore previous instructions" |
+| Sanitização de contexto | Vazamento de PII | Inspecionar prompts logados |
+| Permissões de tool calling | Ações não autorizadas | Testar com role sem permissão |
+| Audit log estruturado | Rastreabilidade | Verificar log após cada tool call |
+| Monitoramento de abuso | Custo e scraping | Checar alertas após uso intenso |
+
+---
+
+## Resposta a incidentes
+
+Para cada tipo de incidente, há um playbook específico:
+
+**Prompt injection detectada:**
+1. Logar o input completo (sanitizado) com nível `security.warning`
+2. Não executar a requisição
+3. Incrementar contador `ai:security:injection:{user_id}`
+4. Após 5 detecções, bloquear temporariamente (1 hora)
+
+**Modelo gerando conteúdo inadequado:**
+1. Armazenar output para análise
+2. Acionar fallback para resposta neutra
+3. Notificar equipe via `#ai-incidents`
+4. Revisar prompt e guardrails
+
+**Bloqueio de usuário em emergência:**
+```python
+async def emergency_block(user_id: str, redis, reason: str) -> None:
+    """Bloqueia usuário imediatamente por 24 horas."""
+    key = f"ai:blocked:{user_id}"
+    await redis.set(key, reason, ex=86400)
+    # SLA: < 5 minutos entre detecção e bloqueio
+```
+
+---
+
+## Prática
+
+**Exercício:** Para um endpoint de IA com acesso a uma ferramenta interna, liste 5 controles e implemente rate limiting e audit log.
+
+**Passo a passo:**
+
+1. Liste 5 controles de segurança para o endpoint (use a tabela de checklist como base)
+2. Para cada controle, descreva o que protege e como implementar
+3. Implemente `RateLimiter` com limites por IP e por usuário
+4. Implemente `log_tool_invocation` com parâmetros sanitizados
+5. Adicione ambos ao endpoint FastAPI via `Depends`
+6. Teste que uma chamada acima do limite retorna 429
+
+**Critérios de validação:**
+- Lista contém pelo menos 5 controles distintos
+- Rate limiting retorna 429 após o limite
+- Audit log registra: usuário (hashed), ferramenta, parâmetros, resultado
+- Parâmetros sensíveis não aparecem no log
+
+---
+
+## Checklist de qualidade
+
+- [ ] Rate limiting por IP e por usuário implementados
+- [ ] Entrada validada contra padrões de prompt injection
+- [ ] PII e dados sensíveis sanitizados antes de entrar no prompt
+- [ ] Ferramentas têm permissões declaradas por papel (role)
+- [ ] Audit log em formato estruturado e imutável (sem UPDATE)
+- [ ] Procedimento de bloqueio de usuário em menos de 5 minutos
+
+---
+
+> Ampliação de: [Segurança e Governança de IA](../../core/06-ai-safety-governance)
+
+> Próximo: [Frontend React para IA](../../frontend/17-react-ai-frontend)

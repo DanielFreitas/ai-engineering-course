@@ -1,14 +1,333 @@
 ﻿---
 sidebar_position: 5
 sidebar_label: "Arquiteturas assíncronas com Pub/Sub"
-title: "Arquiteturas assíncronas com Pub/Sub"
-description: "Módulo 12 do AI Engineering Course."
+title: "Pub/Sub e processamento assíncrono"
+description: "Como desacoplar operações de IA com Pub/Sub — jobs de longa duração, geração de embeddings em background, retentativas e DLQ."
 ---
 
-# Arquiteturas assíncronas com Pub/Sub
+# Pub/Sub e processamento assíncrono
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue projetar um fluxo onde um request HTTP publica um evento e o processamento acontece de forma assíncrona — com retentativas configuradas, idempotência garantida e mensagens com falha movidas para uma Dead Letter Queue.
+
+---
+
+## O problema da sincronicidade em fluxos de IA
+
+Operações de IA pesadas — geração de embeddings para um documento longo, análise de batch, pipelines de RAG — podem levar segundos ou minutos. Bloquear o request HTTP enquanto aguarda o processamento tem três consequências:
+
+1. **Timeout do cliente:** browsers e proxies têm timeouts típicos de 30–60 segundos
+2. **Desperdício de thread:** o servidor fica com threads ocupadas aguardando
+3. **Ausência de retry:** se o processamento falhar, o usuário precisa reenviar tudo
+
+A solução: **desacoplamento via fila de mensagens**.
+
+```
+POST /documents       →  {"job_id": "abc123", "status": "processing"}
+                               ↓ (assíncrono)
+                          Worker processa embedding
+                               ↓
+GET /jobs/abc123      →  {"status": "completed", "chunks": 42}
+```
+
+---
+
+## Padrão Pub/Sub
+
+**Publisher** publica uma mensagem em um **tópico**. **Subscribers** (workers) consomem mensagens do tópico de forma independente. O broker garante a entrega.
+
+```
+[Serviço HTTP] → publica → [Tópico: document.uploaded] → consome → [Worker de Embedding]
+                                                                  → consome → [Worker de Notificação]
+```
+
+Na stack do curso, o broker de referência é o **Google Cloud Pub/Sub** — mas os padrões se aplicam a RabbitMQ, Kafka, SQS e outros.
+
+---
+
+## Envelope de mensagem
+
+Toda mensagem deve ter um envelope padrão para rastreamento e idempotência:
+
+```python
+# models/events.py
+from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+import uuid
+
+class EventEnvelope(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # chave de idempotência
+    type: str                   # ex: "document.uploaded"
+    version: str = "1.0.0"     # semver do schema
+    source: str                 # nome do serviço emissor
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    trace_id: str | None = None # propagado do request originador
+    retry_count: int = 0
+    correlation_id: str | None = None
+
+class DocumentUploadedPayload(BaseModel):
+    document_id: str
+    user_id: str
+    session_id: str
+    file_name: str
+    storage_path: str
+    processing_config: dict = {}
+
+class DocumentUploadedEvent(BaseModel):
+    envelope: EventEnvelope
+    payload: DocumentUploadedPayload
+```
+
+Nomeia-se eventos com **verbos no passado**: `document.uploaded`, `embedding.requested`, `embedding.completed`. O evento descreve o que aconteceu, não o que deve acontecer.
+
+---
+
+## Exemplo: ingestão assíncrona de documentos
+
+### Publisher (endpoint HTTP)
+
+```python
+# routers/documents.py
+import json
+import uuid
+from fastapi import APIRouter, HTTPException
+from models.events import DocumentUploadedEvent, EventEnvelope, DocumentUploadedPayload
+
+router = APIRouter(prefix="/api/v1")
+
+@router.post("/documents", status_code=202)
+async def upload_document(
+    file_name: str,
+    storage_path: str,
+    user_id: str,
+    session_id: str,
+    queue,  # injetado via Depends
+) -> dict:
+    """Aceita o documento e retorna imediatamente. Processamento é assíncrono."""
+    document_id = str(uuid.uuid4())
+
+    event = DocumentUploadedEvent(
+        envelope=EventEnvelope(type="document.uploaded", source="api"),
+        payload=DocumentUploadedPayload(
+            document_id=document_id,
+            user_id=user_id,
+            session_id=session_id,
+            file_name=file_name,
+            storage_path=storage_path,
+        ),
+    )
+
+    # Publica na fila — não bloqueia aguardando processamento
+    await queue.publish(event.model_dump_json())
+
+    # Retorna 202 Accepted com o ID de rastreamento
+    return {
+        "job_id": document_id,
+        "status": "processing",
+        "status_url": f"/api/v1/jobs/{document_id}",
+    }
+```
+
+### Worker (subscriber)
+
+```python
+# workers/embedding_worker.py
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+
+async def process_document_event(message_data: bytes, job_store, embedding_service) -> None:
+    """Processa um evento document.uploaded. Idempotente."""
+    event = json.loads(message_data)
+    envelope = event["envelope"]
+    payload = event["payload"]
+
+    document_id = payload["document_id"]
+    message_id = envelope["id"]
+    retry_count = envelope.get("retry_count", 0)
+
+    # Verificação de idempotência: já processamos essa mensagem?
+    if await job_store.is_already_processed(message_id):
+        logger.info("message_already_processed", extra={"message_id": message_id})
+        return  # acknowledge sem reprocessar
+
+    try:
+        logger.info("embedding_started", extra={
+            "document_id": document_id,
+            "retry": retry_count,
+        })
+
+        # 1. Chunking do documento
+        chunks = await embedding_service.chunk_document(payload["storage_path"])
+
+        # 2. Geração de embeddings
+        embeddings = await embedding_service.generate_embeddings(chunks)
+
+        # 3. Indexação
+        await embedding_service.index_embeddings(document_id, embeddings)
+
+        # 4. Marca como concluído
+        await job_store.mark_completed(
+            message_id=message_id,
+            document_id=document_id,
+            chunks_count=len(chunks),
+        )
+
+        logger.info("embedding_completed", extra={
+            "document_id": document_id,
+            "chunks": len(chunks),
+        })
+
+    except Exception as e:
+        logger.error("embedding_failed", extra={
+            "document_id": document_id,
+            "error": str(e),
+            "retry": retry_count,
+        })
+
+        if retry_count < MAX_RETRIES:
+            # Republica com retry_count incrementado e backoff
+            event["envelope"]["retry_count"] = retry_count + 1
+            delay_seconds = 2 ** retry_count  # backoff exponencial: 1, 2, 4 segundos
+            await asyncio.sleep(delay_seconds)
+            raise  # deixa o broker retentar
+
+        else:
+            # Esgotou tentativas → mover para DLQ
+            dlq_message = {
+                "original_message": event,
+                "failure_reason": str(e),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "retry_count": retry_count,
+            }
+            await job_store.move_to_dlq(message_id, dlq_message)
+            logger.error("message_moved_to_dlq", extra={"message_id": message_id})
+            return  # não re-raise — acknowledge para não retentar mais
+```
+
+### Implementação básica de fila (in-memory para exercício)
+
+```python
+# queues/in_memory_queue.py
+import asyncio
+from collections import deque
+
+class InMemoryQueue:
+    """Fila in-memory para desenvolvimento e exercícios."""
+    def __init__(self):
+        self._queue: deque = deque()
+        self._dead_letters: deque = deque()
+
+    async def publish(self, message: str) -> None:
+        self._queue.append(message)
+
+    async def consume(self, handler, max_messages: int = 10) -> None:
+        """Processa até max_messages mensagens da fila."""
+        processed = 0
+        while self._queue and processed < max_messages:
+            message = self._queue.popleft()
+            try:
+                await handler(message.encode())
+                processed += 1
+            except Exception:
+                self._dead_letters.append(message)
+```
+
+---
+
+## Idempotência
+
+Em sistemas distribuídos, a mesma mensagem pode ser entregue mais de uma vez (falha de ack, reinicialização do worker). O processamento deve ser idempotente:
+
+```python
+# Estratégia: registrar IDs de mensagens processadas
+async def is_already_processed(message_id: str, redis_client) -> bool:
+    """Verifica e registra o ID de mensagem para idempotência."""
+    key = f"processed_msg:{message_id}"
+    # SETNX: só define se não existe
+    was_set = await redis_client.setnx(key, "1")
+    if was_set:
+        await redis_client.expire(key, 86400)  # 24 horas de TTL
+        return False  # primeira vez processando
+    return True  # já processamos antes
+```
+
+---
+
+## Consultando status do job
+
+O usuário precisa saber o que aconteceu com a solicitação assíncrona:
+
+```python
+# routers/jobs.py
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, job_store) -> dict:
+    job = await job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    return {
+        "job_id": job_id,
+        "status": job["status"],  # "processing" | "completed" | "failed"
+        "created_at": job["created_at"],
+        "completed_at": job.get("completed_at"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+```
+
+> Ver: [Integração Frontend-Backend](../../frontend/19-frontend-backend-integration) para como o frontend faz polling desse endpoint.
+
+---
+
+## Monitoramento de filas
+
+| Métrica | O que indica | Alerta quando |
+|---|---|---|
+| Profundidade da fila | Volume de trabalho pendente | `>` threshold por job type |
+| Consumer lag | Atraso de processamento | `>` 30s para indexação |
+| Taxa de DLQ | Frequência de falhas permanentes | Qualquer acúmulo na DLQ |
+| Throughput | Messages/segundo | Queda inesperada |
+
+---
+
+## Prática
+
+**Exercício:** Implemente um fluxo onde `POST /documents` publica um evento e um worker processa o documento de forma assíncrona com retentativa.
+
+**Passo a passo:**
+
+1. Implemente `InMemoryQueue` com `publish` e `consume`
+2. Implemente o endpoint `POST /documents` que publica `DocumentUploadedEvent` e retorna `202`
+3. Implemente um worker que processa o evento (pode simular chunking + embedding)
+4. Simule uma falha na primeira tentativa e valide que reprocessa
+5. Simule 3 falhas consecutivas e valide que a mensagem vai para a DLQ
+6. Implemente `GET /jobs/{job_id}` que retorna o status
+
+**Critérios de validação:**
+- `POST /documents` retorna em menos de 100ms (sem esperar o processamento)
+- Uma falha aciona retry automático (máximo `MAX_RETRIES = 3`)
+- Após 3 falhas, a mensagem aparece na DLQ
+- `GET /jobs/{job_id}` retorna `completed` após processamento com sucesso
+
+---
+
+## Checklist de qualidade
+
+- [ ] Publisher não bloqueia aguardando conclusão do processamento
+- [ ] Mensagens têm `id` único para idempotência
+- [ ] Retry com backoff exponencial: 1s → 2s → 4s
+- [ ] DLQ contém mensagem original + razão do erro + número de tentativas
+- [ ] Logs identificam cada etapa do processamento
+- [ ] Endpoint de status permite verificar progresso do job
+
+---
+
+> Próximo módulo: [Redis e Performance com Cache](../13-redis-performance)

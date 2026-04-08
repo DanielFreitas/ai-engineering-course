@@ -1,14 +1,302 @@
 ﻿---
 sidebar_position: 4
 sidebar_label: "Telemetria orientada à experiência"
-title: "Telemetria orientada à experiência"
-description: "Módulo 20 do AI Engineering Course."
+title: "Telemetria de Experiência para IA"
+description: "Como medir se uma feature de IA está ajudando os usuários — eventos de uso, abandono, aceitação/rejeição e sinais de frustração."
 ---
 
-# Telemetria orientada à experiência
+# Telemetria de Experiência para IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue definir um conjunto mínimo de eventos de telemetria para uma feature de IA, explicar o que cada evento mede em termos de experiência do usuário e propor como correlacionar esses eventos com métricas de qualidade do modelo.
+
+---
+
+## Por que métricas técnicas não contam a história completa
+
+Métricas de infraestrutura (latência, tokens, uptime) dizem se o sistema *funciona*. Elas não dizem se o sistema *ajuda*.
+
+| Métrica técnica | O que não mede |
+|---|---|
+| Latência do modelo: 800ms | Se a resposta foi útil |
+| 99.9% de uptime | Se o usuário voltou a usar |
+| Tokens consumidos: 1200 | Se o usuário aplicou a sugestão |
+| 0 erros 500 | Se o usuário ficou frustrado |
+
+A hierarquia completa:
+
+```
+Técnica:  latência, tokens, erros, uptime
+   ↓
+Produto:  aceitação, rejeição, regeneração, abandono
+   ↓
+Negócio:  retenção, NPS, taxa de conclusão de tarefa
+```
+
+Telemetria de experiência preenche a camada de produto.
+
+---
+
+## Tipos de eventos de telemetria para IA
+
+### Eventos de engajamento positivo
+
+```typescript
+// Usuário aplicou a resposta da IA
+track('ai_response_accepted', {
+  session_id: string,
+  request_id: string,
+  feature: string,          // ex: "document_summary"
+  model_version: string,
+  ttft_ms: number,          // time-to-first-token
+  total_time_ms: number,
+  response_length: number,
+});
+
+// Usuário copiou o conteúdo gerado
+track('ai_content_copied', {
+  session_id: string,
+  request_id: string,
+  feature: string,
+  copied_length: number,
+});
+```
+
+### Eventos de frustração
+
+```typescript
+// Usuário pediu nova resposta
+track('ai_response_regenerated', {
+  session_id: string,
+  request_id: string,
+  feature: string,
+  regeneration_count: number,  // quantas vezes regenerou nesta sessão
+  previous_response_length: number,
+});
+
+// Usuário editou a sugestão antes de usar
+track('ai_response_edited', {
+  session_id: string,
+  request_id: string,
+  feature: string,
+  edit_distance_ratio: number,  // 0.0 = sem edição, 1.0 = substituiu tudo
+});
+
+// Usuário deu feedback negativo explícito
+track('ai_feedback_negative', {
+  session_id: string,
+  request_id: string,
+  reason?: 'incorrect' | 'irrelevant' | 'harmful' | 'other',
+});
+```
+
+### Eventos de abandono
+
+```typescript
+// Usuário saiu sem usar a resposta
+track('ai_session_abandoned', {
+  session_id: string,
+  feature: string,
+  last_status: 'loading' | 'streaming' | 'success' | 'error',
+  session_duration_ms: number,
+  turns: number,             // quantas perguntas na sessão
+});
+
+// Usuário cancelou durante geração
+track('ai_generation_cancelled', {
+  session_id: string,
+  request_id: string,
+  cancelled_after_ms: number,
+  partial_length: number,
+});
+```
+
+---
+
+## Implementação: cliente de telemetria
+
+```typescript
+// lib/telemetry.ts
+type EventProperties = Record<string, string | number | boolean | undefined>;
+
+interface TelemetryEvent {
+  name: string;
+  properties: EventProperties;
+  timestamp: string;
+  session_id: string;
+}
+
+class TelemetryClient {
+  private sessionId: string;
+  private queue: TelemetryEvent[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor() {
+    this.sessionId = this.getOrCreateSessionId();
+  }
+
+  private getOrCreateSessionId(): string {
+    const key = 'ai_session_id';
+    let id = sessionStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem(key, id);
+    }
+    return id;
+  }
+
+  track(name: string, properties: EventProperties = {}) {
+    const event: TelemetryEvent = {
+      name,
+      properties: {
+        ...properties,
+        session_id: this.sessionId,
+      },
+      timestamp: new Date().toISOString(),
+      session_id: this.sessionId,
+    };
+
+    this.queue.push(event);
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush() {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => this.flush(), 3000);
+  }
+
+  private async flush() {
+    this.flushTimer = null;
+    if (this.queue.length === 0) return;
+
+    const batch = this.queue.splice(0);
+    try {
+      await fetch('/api/v1/telemetry/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ events: batch }),
+      });
+    } catch {
+      // Eventos de telemetria não devem interromper o fluxo principal
+    }
+  }
+}
+
+export const telemetry = new TelemetryClient();
+export const track = telemetry.track.bind(telemetry);
+```
+
+---
+
+## Uso nos componentes existentes
+
+```typescript
+// Dentro do hook useAIResponse (módulo 17)
+import { track } from '../lib/telemetry';
+
+// Quando a resposta é gerada com sucesso:
+if (action.type === 'COMPLETE') {
+  track('ai_response_received', {
+    session_id: sessionId,
+    request_id: requestId,
+    feature: featureName,
+    ttft_ms: timeToFirstToken,
+  });
+}
+
+// Quando o usuário clica em regenerar:
+const handleRegenerate = () => {
+  track('ai_response_regenerated', {
+    session_id: sessionId,
+    request_id: requestId,
+    feature: featureName,
+    regeneration_count: regenerationCount + 1,
+  });
+  reset();
+  submit(question);
+};
+
+// Quando o usuário aceita a resposta (ex: clica em "Usar"):
+const handleAccept = () => {
+  track('ai_response_accepted', {
+    session_id: sessionId,
+    request_id: requestId,
+    feature: featureName,
+    total_time_ms: Date.now() - startTime,
+  });
+};
+```
+
+---
+
+## Métricas derivadas dos eventos
+
+| Métrica | Fórmula | Interpretar como |
+|---|---|---|
+| Taxa de aceitação | `ai_response_accepted / ai_response_received` | Feature está ajudando? |
+| Taxa de regeneração | `ai_response_regenerated / ai_response_received` | Respostas são relevantes? |
+| Taxa de abandono | `ai_session_abandoned / ai_session_started` | Usuário confia no fluxo? |
+| Edit ratio médio | Média de `edit_distance_ratio` | Respostas precisam de quanto ajuste? |
+| Frustração por sessão | Regenerações `>= 3` na mesma sessão | Casos críticos |
+
+---
+
+## Correlação: experiência × performance
+
+```typescript
+// Ao disparar ai_response_accepted, incluir dados de performance:
+track('ai_response_accepted', {
+  session_id,
+  request_id,
+  feature: 'chat',
+  // Métricas técnicas no mesmo evento
+  ttft_ms: performance.now() - requestStart,
+  model_version: 'gpt-4o-2024-08',
+  // Contexto de qualidade
+  sources_count: sources.length,
+  response_length: content.length,
+});
+```
+
+Isso permite consultas como:
+- "Respostas do modelo v2 têm maior taxa de aceitação que v1?"
+- "Sessões com TTFT `>` 3s têm maior taxa de abandono?"
+
+---
+
+## Prática
+
+**Exercício:** Para uma feature de IA de sua escolha (ex: geração de resumo, chatbot de suporte, sugestão de código), defina 5–8 eventos de telemetria.
+
+Use a tabela abaixo:
+
+| Nome do evento | Propriedades | Quando disparar | O que mede |
+|---|---|---|---|
+| `ai_response_accepted` | `session_id`, `request_id`, `feature` | Usuário clica "Usar resposta" | Taxa de utilidade |
+| `ai_response_regenerated` | `session_id`, `regeneration_count` | Usuário clica "Regenerar" | Frustração com resposta |
+| ... | ... | ... | ... |
+
+**Critérios de validação:**
+- 5–8 eventos definidos com nome, propriedades e trigger claros
+- Pelo menos um evento mede aceitação explícita
+- Pelo menos um evento mede frustração (regeneração `>= 3` ou abandono)
+- Os eventos permitem calcular taxa de aceitação geral da feature
+
+---
+
+## Checklist de qualidade
+
+- [ ] Eventos têm nomes consistentes (`ai_response_accepted`, `ai_response_regenerated`)
+- [ ] Propriedades dos eventos incluem `session_id` para correlação
+- [ ] Eventos de abandono são capturados (não apenas ações positivas)
+- [ ] A coleta de eventos não bloqueia o fluxo principal (fire-and-forget)
+- [ ] Existe um plano de análise: "com esses eventos, consigo responder X"
+
+---
+
+> Ver: [Frontend React para IA](../17-react-ai-frontend) — os componentes onde os eventos são disparados
+
+> Ver: [Qualidade de UX para IA](../18-ai-ux-quality) — melhorias guiadas por telemetria
+
+> Ver: [LLMOps: Ciclo de vida em produção](../../backend/15-llmops-lifecycle) — dados de experiência informando decisões de modelo

@@ -1,14 +1,311 @@
 ﻿---
 sidebar_position: 4
 sidebar_label: "Persistência e decisões arquiteturais"
-title: "Persistência e decisões arquiteturais"
-description: "Módulo 11 do AI Engineering Course."
+title: "Persistência de contexto e histórico"
+description: "Como modelar e implementar persistência de dados em sistemas de IA — histórico de conversação, traces, schema Postgres e trade-offs SQL vs. NoSQL."
 ---
 
-# Persistência e decisões arquiteturais
+# Persistência de contexto e histórico
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue modelar um esquema mínimo para armazenar histórico de interações de IA, implementar operações básicas de inserção e consulta com Postgres, e explicar os trade-offs entre SQL e NoSQL para diferentes tipos de dados do sistema.
+
+---
+
+## O que se perde sem persistência adequada
+
+Sem persistência, o sistema de IA perde três capacidades críticas:
+
+1. **Continuidade:** o usuário não pode retomar uma conversa em outro dispositivo ou sessão
+2. **Auditoria:** não é possível investigar o que o modelo gerou em um incidente
+3. **Melhoria:** não há dados históricos para avaliar qualidade ou treinar versões futuras
+
+A questão não é *se* persistir, mas *o que* persistir, *onde* e *por quanto tempo*.
+
+---
+
+## O que precisa ser persistido
+
+Sistemas de IA produzem quatro categorias de dados que precisam de tratamento diferente:
+
+| Categoria | Exemplos | Banco recomendado | Retenção típica |
+|---|---|---|---|
+| **Histórico conversacional** | Mensagens, sessões | Postgres | 90 dias |
+| **Traces de execução** | Logs de tool calls, steps | MongoDB ou Postgres | 30 dias |
+| **Preferências do usuário** | Memória longa, configurações | Postgres | Indefinido |
+| **Vetores de contexto** | Embeddings de documentos | pgvector (Postgres) | Por documento |
+
+---
+
+## Esquema Postgres: histórico conversacional
+
+O esquema mínimo para histórico de chat consiste em duas tabelas: sessões e turnos.
+
+```sql
+-- Tabela de sessões
+CREATE TABLE ai_sessions (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id),
+    title         TEXT,
+    model_version VARCHAR(100) NOT NULL,
+    status        VARCHAR(20) NOT NULL DEFAULT 'active'
+                  CHECK (status IN ('active', 'archived', 'deleted')),
+    token_count   INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at    TIMESTAMPTZ,
+    metadata      JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_ai_sessions_user_id ON ai_sessions(user_id);
+CREATE INDEX idx_ai_sessions_status  ON ai_sessions(status, updated_at DESC);
+```
+
+```sql
+-- Tabela de turnos (append-only — nunca faça UPDATE)
+CREATE TABLE conversation_turns (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id     UUID NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,
+    turn_index     INTEGER NOT NULL,
+    role           VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content        TEXT NOT NULL,
+    content_tokens INTEGER NOT NULL DEFAULT 0,
+    tool_calls     JSONB,
+    tool_results   JSONB,
+    model_used     VARCHAR(100),
+    prompt_version VARCHAR(50),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (session_id, turn_index)
+);
+
+CREATE INDEX idx_turns_session_id ON conversation_turns(session_id, turn_index);
+```
+
+**Por que append-only?** O histórico de chat é um log imutável. Nunca edite mensagens já enviadas — se for necessário corrigir, insira uma nova versão com referência à anterior. Isso simplifica concorrência e facilita auditoria.
+
+---
+
+## Operações em Python com asyncpg
+
+```python
+# repositories/session_repository.py
+import uuid
+from datetime import datetime, timezone
+import asyncpg
+
+class SessionRepository:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def create_session(self, user_id: str, model_version: str) -> str:
+        """Cria nova sessão e retorna o session_id."""
+        session_id = str(uuid.uuid4())
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ai_sessions (id, user_id, model_version)
+                VALUES ($1, $2, $3)
+                """,
+                session_id, user_id, model_version,
+            )
+        return session_id
+
+    async def append_turn(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        content_tokens: int,
+        model_used: str | None = None,
+        prompt_version: str | None = None,
+    ) -> None:
+        """Insere um novo turno na sessão. turn_index é calculado automaticamente."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO conversation_turns
+                  (session_id, turn_index, role, content, content_tokens, model_used, prompt_version)
+                VALUES (
+                  $1,
+                  (SELECT COALESCE(MAX(turn_index), -1) + 1
+                   FROM conversation_turns WHERE session_id = $1),
+                  $2, $3, $4, $5, $6
+                )
+                """,
+                session_id, role, content, content_tokens, model_used, prompt_version,
+            )
+            # Atualiza token_count acumulado na sessão
+            await conn.execute(
+                "UPDATE ai_sessions SET token_count = token_count + $1, updated_at = $2 WHERE id = $3",
+                content_tokens, datetime.now(timezone.utc), session_id,
+            )
+
+    async def get_turns(self, session_id: str, limit: int = 50) -> list[dict]:
+        """Retorna os últimos N turnos de uma sessão, ordenados por turn_index."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT role, content, content_tokens, model_used, created_at
+                FROM conversation_turns
+                WHERE session_id = $1
+                ORDER BY turn_index ASC
+                LIMIT $2
+                """,
+                session_id, limit,
+            )
+        return [dict(row) for row in rows]
+```
+
+---
+
+## MongoDB para traces semi-estruturados
+
+Traces de execução de IA (steps de raciocínio, resultados de tool calls, logs de decisão) têm estrutura variável e crescem com o tempo. MongoDB é adequado para esse padrão:
+
+```python
+# repositories/trace_repository.py
+from datetime import datetime, timezone
+from pymongo import MongoClient
+from pymongo.collection import Collection
+
+class TraceRepository:
+    def __init__(self, collection: Collection):
+        self._col = collection
+
+    def insert_execution_trace(
+        self,
+        session_id: str,
+        step_type: str,       # "llm_call", "tool_call", "validation"
+        input_data: dict,
+        output_data: dict,
+        latency_ms: int,
+        error: str | None = None,
+    ) -> str:
+        """Insere um trace de execução. Retorna o _id inserido."""
+        doc = {
+            "session_id": session_id,
+            "step_type": step_type,
+            "input": input_data,
+            "output": output_data,
+            "latency_ms": latency_ms,
+            "error": error,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        result = self._col.insert_one(doc)
+        return str(result.inserted_id)
+
+    def get_session_traces(self, session_id: str) -> list[dict]:
+        """Retorna todos os traces de uma sessão, ordenados por tempo."""
+        cursor = self._col.find(
+            {"session_id": session_id},
+            sort=[("timestamp", 1)],
+        )
+        return list(cursor)
+```
+
+---
+
+## Vetores com pgvector
+
+Para persistir embeddings de contexto sem adicionar um banco vetorial dedicado:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE context_embeddings (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id  UUID NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,
+    chunk_text  TEXT NOT NULL,
+    embedding   vector(1536) NOT NULL,
+    source_type VARCHAR(50),   -- 'conversation', 'document', 'tool_result'
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Índice HNSW para busca aproximada eficiente
+CREATE INDEX idx_embeddings_hnsw ON context_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+```
+
+> Ver: [Embeddings e RAG](../../core/04-embeddings-rag) para quando migrar para banco vetorial dedicado.
+
+---
+
+## SQL vs. NoSQL: quando usar cada um
+
+| Critério | SQL (Postgres) | NoSQL (MongoDB) |
+|---|---|---|
+| Estrutura dos dados | Bem definida, estável | Variável, evolutiva |
+| Queries por relação | Joins eficientes | Difícil |
+| Volume de escrita | Moderado, transacional | Alto, schema-less |
+| Auditoria e retenção | Políticas fáceis de aplicar | Mais complexo |
+| **Usar para:** | Sessões, mensagens, usuários | Traces, logs de execução |
+
+Na prática, a maioria dos sistemas de IA usa **ambos**: Postgres para dados estruturados de negócio e MongoDB (ou Elasticsearch) para traces e logs semi-estruturados.
+
+---
+
+## Política de retenção
+
+```python
+# scheduler/cleanup_jobs.py
+import asyncpg
+
+async def cleanup_expired_sessions(pool: asyncpg.Pool) -> int:
+    """Remove sessões expiradas e seus turnos (ON DELETE CASCADE)."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE ai_sessions
+            SET status = 'deleted'
+            WHERE expires_at < now() AND status = 'active'
+            """,
+        )
+    deleted = int(result.split()[-1])
+    return deleted
+```
+
+Política recomendada:
+- Histórico de sessão: 90 dias (configurável por usuário)
+- Traces de execução: 30 dias
+- Preferências do usuário: indefinido até exclusão explícita
+- **Nunca armazenar chaves de API, tokens de acesso ou PII desnecessário**
+
+---
+
+## Prática
+
+**Exercício:** Modele e implemente o esquema mínimo para armazenar o histórico de interações de um chatbot.
+
+**Passo a passo:**
+
+1. Crie as tabelas `ai_sessions` e `conversation_turns` no Postgres local (ou SQLite para o exercício)
+2. Implemente `create_session(user_id, model_version) -> session_id`
+3. Implemente `append_turn(session_id, role, content, tokens)`
+4. Implemente `get_turns(session_id) -> list[dict]`
+5. Teste com 3 usuários, 2 sessões por usuário, 5 mensagens por sessão
+6. Valide que a consulta por `session_id` retorna mensagens na ordem correta
+
+**Critérios de validação:**
+- Múltiplos usuários e sessões coexistem sem interferência
+- Mensagens retornam em ordem crescente de `turn_index`
+- `token_count` na tabela `ai_sessions` é a soma dos tokens de todos os turnos
+- Timestamps estão em UTC
+
+---
+
+## Checklist de qualidade
+
+- [ ] UUIDs como chaves primárias (não IDs sequenciais)
+- [ ] Timestamps em UTC em todos os registros
+- [ ] Índices criados em `user_id`, `session_id`, `created_at`
+- [ ] Schema de mensagens é append-only (sem UPDATE)
+- [ ] Dados sensíveis do usuário não armazenados sem necessidade
+- [ ] Política de retenção documentada e com limpeza automática
+
+---
+
+> Ampliação de: [Contexto, Memória e Estado](../09-context-memory-state)
+
+> Próximo módulo: [Pub/Sub e Processamento Assíncrono](../12-pubsub-async)

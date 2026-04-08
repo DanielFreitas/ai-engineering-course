@@ -2,13 +2,301 @@
 sidebar_position: 2
 sidebar_label: "Contexto, memória e estado"
 title: "Contexto, memória e estado"
-description: "Módulo 09 do AI Engineering Course."
+description: "Como gerenciar histórico de conversação em sistemas de IA — truncamento, sumarização, memória de curto e longo prazo e impacto em custo."
 ---
 
-# Contexto, memória e estado
+# Contexto, memória e estado conversacional
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue implementar uma estratégia de gerenciamento de histórico de conversa — escolhendo entre janela deslizante e sumarização — e entende o impacto de cada abordagem em custo, coerência e latência.
+
+---
+
+## O problema do contexto crescente
+
+Modelos de linguagem não têm memória entre chamadas. Cada chamada é independente: o modelo só "sabe" o que está dentro da **janela de contexto** dessa requisição específica.
+
+Para simular uma conversa contínua, o serviço precisa incluir o histórico de mensagens anteriores em cada nova chamada. O problema: o histórico cresce a cada turno.
+
+```
+Turno 1: [system] + [user1]                         → ~200 tokens
+Turno 10: [system] + [user1..user9] + [user10]     → ~2.000 tokens
+Turno 50: [system] + [user1..user49] + [user50]    → ~10.000 tokens
+```
+
+Os efeitos práticos de não gerenciar o contexto:
+
+- **Custo:** tokens crescem linearmente; em GPT-4o, 50 turnos de chat podem custar 10× mais que o necessário
+- **Latência:** contextos maiores aumentam a latência de geração
+- **Limite:** o modelo tem um teto — `context window` — além do qual a chamada falha
+
+> **Importante:** este módulo trata de **contexto de aplicação** (o estado acumulado de uma sessão). Para a janela de tokens que o modelo recebe em uma chamada, veja [Integração com a API do LLM](../../core/02-llm-api-integration).
+
+---
+
+## Tipos de memória
+
+Este curso distingue três conceitos que costumam ser confundidos:
+
+| Conceito | O que é | Ciclo de vida |
+|---|---|---|
+| **Histórico (`history`)** | Sequência de mensagens trocadas na sessão | Começa e termina com a sessão |
+| **Contexto (`context`)** | Seleção do histórico que vai na chamada atual | Reconstruído a cada turno |
+| **Memória (`memory`)** | Fatos persistentes sobre o usuário | Sobrevive entre sessões |
+
+A distinção importa porque as estratégias de gerenciamento são diferentes para cada um.
+
+---
+
+## Memória de curto prazo: gerenciando o histórico
+
+### Estrutura de dados
+
+```python
+from pydantic import BaseModel
+from typing import Literal
+from datetime import datetime
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+    timestamp: datetime
+    token_count: int | None = None
+```
+
+```python
+class ConversationSession(BaseModel):
+    session_id: str         # UUID único por conversa
+    user_id: str
+    messages: list[Message]
+    created_at: datetime
+    updated_at: datetime
+    total_tokens_used: int = 0
+```
+
+### Estratégia 1: Janela deslizante (sliding window)
+
+A estratégia mais simples: mantém apenas as N mensagens mais recentes.
+
+```python
+# context_builder.py
+import tiktoken
+
+_ENCODER = tiktoken.encoding_for_model("gpt-4o")
+
+def count_tokens(text: str) -> int:
+    return len(_ENCODER.encode(text))
+
+def build_context_sliding_window(
+    history: list[dict],
+    system_prompt: str,
+    max_tokens: int = 4096,
+) -> list[dict]:
+    """
+    Retorna lista de mensagens para a API do LLM.
+    - O system prompt é sempre preservado
+    - Mensagens mais recentes são priorizadas
+    - Nunca excede max_tokens
+    """
+    system_tokens = count_tokens(system_prompt)
+    available = max_tokens - system_tokens
+
+    # Percorre o histórico de trás para frente (mais recente primeiro)
+    selected: list[dict] = []
+    tokens_used = 0
+
+    for msg in reversed(history):
+        msg_tokens = count_tokens(msg["content"])
+        if tokens_used + msg_tokens > available:
+            break  # não cabe mais
+        selected.insert(0, msg)
+        tokens_used += msg_tokens
+
+    return [{"role": "system", "content": system_prompt}] + selected
+```
+
+### Estratégia 2: Sumarização
+
+Quando conversas longas precisam preservar o fio condutor, a sumarização comprime mensagens antigas:
+
+```python
+async def build_context_with_summary(
+    history: list[dict],
+    system_prompt: str,
+    llm_client,
+    max_tokens: int = 4096,
+    summary_threshold: int = 20,  # mensagens antes de sumarizar
+) -> list[dict]:
+    """
+    Se o histórico tem mais de summary_threshold mensagens,
+    sumariza as mensagens mais antigas e mantém as recentes integralmente.
+    """
+    if len(history) <= summary_threshold:
+        return build_context_sliding_window(history, system_prompt, max_tokens)
+
+    # Divide: mensagens antigas (a sumarizar) + recentes (a preservar)
+    old_messages = history[:-summary_threshold]
+    recent_messages = history[-summary_threshold:]
+
+    # Sumariza as antigas com um modelo menor
+    summary_prompt = "Resuma os pontos principais desta conversa em 3-5 frases:\n"
+    for msg in old_messages:
+        summary_prompt += f"{msg['role'].upper()}: {msg['content']}\n"
+
+    summary_content, _ = await llm_client.complete(
+        system="Você é um assistente especializado em resumir conversas.",
+        user=summary_prompt,
+    )
+
+    summary_message = {
+        "role": "system",
+        "content": f"[Resumo da conversa anterior]: {summary_content}",
+    }
+
+    context = [{"role": "system", "content": system_prompt}, summary_message]
+    context.extend(recent_messages)
+    return context
+```
+
+---
+
+## Memória de longo prazo
+
+A memória de longo prazo armazena fatos sobre o usuário que sobrevivem entre sessões — não é o histórico de mensagens, mas informações estruturadas extraídas delas.
+
+```python
+class UserMemory(BaseModel):
+    user_id: str
+    facts: list[str]        # ex: "prefere respostas curtas"
+    preferences: dict       # ex: {"language": "pt-BR", "tone": "formal"}
+    last_updated: datetime
+```
+
+Para injetar a memória no contexto de uma nova sessão:
+
+```python
+def inject_long_term_memory(
+    context: list[dict],
+    memory: UserMemory,
+) -> list[dict]:
+    """Insere memória de longo prazo logo após o system prompt."""
+    if not memory.facts:
+        return context
+
+    memory_content = "Informações relevantes sobre o usuário:\n"
+    memory_content += "\n".join(f"- {fact}" for fact in memory.facts)
+
+    memory_message = {"role": "system", "content": memory_content}
+
+    # Insere após o system prompt original (índice 0)
+    return [context[0], memory_message] + context[1:]
+```
+
+> Ver: [Persistência de Contexto e Histórico](../11-persistence-context) para como armazenar e recuperar essa memória.
+
+---
+
+## Medindo o impacto
+
+Antes de implementar qualquer estratégia, meça o custo atual. Com `tiktoken`:
+
+```python
+def estimate_cost(messages: list[dict], model: str = "gpt-4o") -> dict:
+    """Estima custo em tokens e USD para uma lista de mensagens."""
+    encoder = tiktoken.encoding_for_model(model)
+    total_tokens = sum(
+        len(encoder.encode(msg["content"])) for msg in messages
+    )
+    # Preços aproximados GPT-4o (verifique openai.com/pricing)
+    cost_per_1k_input = 0.0025  # USD
+
+    return {
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round((total_tokens / 1000) * cost_per_1k_input, 6),
+    }
+```
+
+Exemplo de comparação antes/depois de truncamento:
+
+```python
+# Simulação: conversa de 20 turnos sem gerenciamento
+full_history = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": f"Mensagem de exemplo número {i+1} com conteúdo típico."}
+                for i in range(40)]
+
+cost_sem_truncamento = estimate_cost(full_history)
+# {'total_tokens': ~4000, 'estimated_cost_usd': 0.01}
+
+context_truncado = build_context_sliding_window(full_history, "System prompt.", max_tokens=1000)
+cost_com_truncamento = estimate_cost(context_truncado)
+# {'total_tokens': ~800, 'estimated_cost_usd': 0.002}
+```
+
+---
+
+## Quando persistir vs. recalcular
+
+| Situação | Recomendação |
+|---|---|
+| Sessão ainda ativa | Manter histórico em memória (Redis ou in-memory) |
+| Sessão encerrada há menos de 24h | Persistir em banco; recarregar se necessário |
+| Sessão de mais de 7 dias | Persistir apenas o resumo comprimido |
+| Memória de longo prazo | Sempre persistir em banco relacional |
+
+---
+
+## Prática
+
+**Exercício:** Implemente uma função `build_context(history, max_tokens)` que recebe um histórico de conversa e retorna uma versão truncada que respeita o limite de tokens. Compare o custo estimado de uma conversa de 20 turnos sem e com a estratégia.
+
+**Passo a passo:**
+
+1. Instale `tiktoken`: `pip install tiktoken`
+2. Implemente `count_tokens(text: str) -> int`
+3. Implemente `build_context(history, max_tokens, system_prompt)` usando sliding window
+4. Crie um histórico de teste com 40 mensagens
+5. Compare `estimate_cost(full_history)` vs. `estimate_cost(build_context(...))`
+6. Escreva um teste que garante que `build_context` nunca retorna mais tokens que `max_tokens`
+
+**Critérios de validação:**
+- A função nunca retorna um histórico maior que `max_tokens`
+- O system prompt está sempre na primeira posição da lista retornada
+- O custo estimado com truncamento é menor que sem truncamento
+- O teste é independente — não faz chamadas a APIs externas
+
+```python
+# Teste de exemplo
+def test_build_context_respeita_limite():
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": "Mensagem de teste com conteúdo típico utilizado em avaliações."}
+        for i in range(30)
+    ]
+    system = "Você é um assistente prestativo."
+    max_tokens = 500
+
+    result = build_context_sliding_window(history, system, max_tokens)
+    total = sum(count_tokens(m["content"]) for m in result)
+
+    assert total <= max_tokens
+    assert result[0]["role"] == "system"
+    assert result[0]["content"] == system
+```
+
+---
+
+## Checklist de qualidade
+
+- [ ] Limite de tokens é verificado antes de cada chamada ao modelo
+- [ ] O system prompt é sempre preservado no truncamento
+- [ ] Estratégia de truncamento está documentada no código (docstring ou comentário)
+- [ ] Custo em tokens é logado por turno
+- [ ] Memória de longo prazo é separada do histórico de sessão
+- [ ] Existe fallback quando o histórico não pode ser recuperado (sessão nova)
+
+---
+
+> Ampliação de: [Integração com a API do LLM](../../core/02-llm-api-integration)
+
+> Próximo módulo: [Tool Calling e Orquestração](../10-tool-calling-orchestration)

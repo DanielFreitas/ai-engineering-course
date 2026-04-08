@@ -1,14 +1,387 @@
 ﻿---
 sidebar_position: 1
 sidebar_label: "Frontend de aplicações com IA em React"
-title: "Frontend de aplicações com IA em React"
-description: "Módulo 17 do AI Engineering Course."
+title: "Frontend React para IA"
+description: "Como construir interfaces React para features de IA — streaming com SSE, estados de carregamento, regeneração, fontes e tratamento de erros."
 ---
 
-# Frontend de aplicações com IA em React
+# Frontend React para IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue criar um componente React funcional que exibe os quatro estados de uma resposta de IA (loading, streaming, success, error), recebe chunk-by-chunk via streaming e implementa regeneração com limpeza de estado.
+
+---
+
+## O que a UI de IA precisa fazer que não existia antes
+
+Uma interface tradicional recebe uma resposta completa e renderiza. Uma interface de IA lida com:
+
+- **Latência alta:** 1–5 segundos é comum; o usuário precisa de feedback imediato
+- **Resultados parciais:** streaming torna a espera tolerável
+- **Incerteza:** o modelo pode falhar, produzir conteúdo inadequado ou ser cancelado
+- **Regeneração:** o usuário precisa poder pedir uma nova resposta sem reiniciar a sessão
+
+A consequência direta: a UI de IA precisa de uma **máquina de estados** explícita, não de um `isLoading` boolean.
+
+---
+
+## Máquina de estados de uma resposta de IA
+
+```
+idle → loading → streaming → success
+              ↘          ↗
+               error
+idle → loading → cancelled
+```
+
+| Estado | O que mostrar |
+|---|---|
+| `idle` | Campo de input, pronto para receber pergunta |
+| `loading` | Spinner ou skeleton — esperando primeira resposta |
+| `streaming` | Texto acumulando progressivamente, botão "Parar" |
+| `success` | Resposta completa, botão "Regenerar" |
+| `error` | Mensagem amigável de erro, botão "Tentar novamente" |
+| `cancelled` | Resposta parcial preservada, estado reset para idle |
+
+---
+
+## Hook: `useAIResponse`
+
+```typescript
+// hooks/useAIResponse.ts
+import { useReducer, useCallback, useRef } from 'react';
+
+type AIState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'streaming'; content: string }
+  | { status: 'success'; content: string }
+  | { status: 'error'; message: string }
+  | { status: 'cancelled'; partial: string };
+
+type AIAction =
+  | { type: 'START' }
+  | { type: 'TOKEN'; token: string }
+  | { type: 'COMPLETE' }
+  | { type: 'ERROR'; message: string }
+  | { type: 'CANCEL' }
+  | { type: 'RESET' };
+
+function aiReducer(state: AIState, action: AIAction): AIState {
+  switch (action.type) {
+    case 'START':
+      return { status: 'loading' };
+    case 'TOKEN':
+      if (state.status === 'loading') {
+        return { status: 'streaming', content: action.token };
+      }
+      if (state.status === 'streaming') {
+        return { status: 'streaming', content: state.content + action.token };
+      }
+      return state;
+    case 'COMPLETE':
+      if (state.status === 'streaming') {
+        return { status: 'success', content: state.content };
+      }
+      return state;
+    case 'ERROR':
+      return { status: 'error', message: action.message };
+    case 'CANCEL':
+      const partial = state.status === 'streaming' ? state.content : '';
+      return { status: 'cancelled', partial };
+    case 'RESET':
+      return { status: 'idle' };
+    default:
+      return state;
+  }
+}
+
+interface UseAIResponseOptions {
+  onComplete?: (content: string) => void;
+}
+
+export function useAIResponse(options: UseAIResponseOptions = {}) {
+  const [state, dispatch] = useReducer(aiReducer, { status: 'idle' });
+  const abortRef = useRef<AbortController | null>(null);
+
+  const submit = useCallback(async (question: string) => {
+    // Cancela requisição anterior se houver
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    dispatch({ type: 'START' });
+
+    try {
+      const response = await fetch('/api/v1/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: question }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        // Parse SSE: "data: {\"content\":\"...\"}\n\n"
+        for (const line of chunk.split('\n')) {
+          if (line.startsWith('data: ')) {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'chunk') {
+              dispatch({ type: 'TOKEN', token: data.content });
+            } else if (data.type === 'done') {
+              dispatch({ type: 'COMPLETE' });
+              options.onComplete?.(data.full_content ?? '');
+            }
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        dispatch({ type: 'CANCEL' });
+      } else {
+        dispatch({ type: 'ERROR', message: 'Não foi possível obter a resposta.' });
+      }
+    }
+  }, [options]);
+
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  const reset = useCallback(() => {
+    dispatch({ type: 'RESET' });
+  }, []);
+
+  return { state, submit, cancel, reset };
+}
+```
+
+---
+
+## Componente: `AIResponsePanel`
+
+```tsx
+// components/AIResponsePanel.tsx
+import React from 'react';
+import { useAIResponse } from '../hooks/useAIResponse';
+
+interface AIResponsePanelProps {
+  question: string;
+}
+
+export function AIResponsePanel({ question }: AIResponsePanelProps) {
+  const { state, submit, cancel, reset } = useAIResponse();
+
+  React.useEffect(() => {
+    if (question) {
+      submit(question);
+    }
+  }, [question, submit]);
+
+  return (
+    <div className="ai-response-panel">
+      {/* Estado: loading */}
+      {state.status === 'loading' && (
+        <div role="status" aria-label="Carregando resposta">
+          <div className="skeleton-line" />
+          <div className="skeleton-line short" />
+        </div>
+      )}
+
+      {/* Estado: streaming */}
+      {state.status === 'streaming' && (
+        <div>
+          <p className="response-text">{state.content}<span className="cursor" /></p>
+          <button onClick={cancel} aria-label="Parar geração">
+            Parar
+          </button>
+        </div>
+      )}
+
+      {/* Estado: success */}
+      {state.status === 'success' && (
+        <div>
+          <p className="response-text">{state.content}</p>
+          <button onClick={() => { reset(); submit(question); }} aria-label="Regenerar resposta">
+            Regenerar
+          </button>
+        </div>
+      )}
+
+      {/* Estado: cancelled */}
+      {state.status === 'cancelled' && (
+        <div>
+          {state.partial && <p className="response-text partial">{state.partial}</p>}
+          <p className="status-note">Geração interrompida.</p>
+          <button onClick={() => { reset(); submit(question); }}>
+            Tentar novamente
+          </button>
+        </div>
+      )}
+
+      {/* Estado: error */}
+      {state.status === 'error' && (
+        <div role="alert">
+          <p className="error-message">{state.message}</p>
+          <button onClick={() => { reset(); submit(question); }}>
+            Tentar novamente
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## Exibindo fontes e referências (RAG)
+
+Quando o backend retorna `sources` junto com a resposta:
+
+```tsx
+// components/SourcePanel.tsx
+interface Source {
+  id: string;
+  title: string;
+  url?: string;
+  excerpt: string;
+}
+
+interface SourcePanelProps {
+  sources: Source[];
+}
+
+export function SourcePanel({ sources }: SourcePanelProps) {
+  if (sources.length === 0) return null;
+
+  return (
+    <details className="source-panel">
+      <summary>Fontes ({sources.length})</summary>
+      <ol>
+        {sources.map((source) => (
+          <li key={source.id}>
+            {source.url ? (
+              <a href={source.url} target="_blank" rel="noopener noreferrer">
+                {source.title}
+              </a>
+            ) : (
+              <strong>{source.title}</strong>
+            )}
+            <blockquote>{source.excerpt}</blockquote>
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+```
+
+---
+
+## SSE com `EventSource` (alternativa ao fetch streaming)
+
+Para backends que implementam SSE clássico:
+
+```typescript
+// hooks/useSSEResponse.ts
+import { useEffect, useRef } from 'react';
+
+export function useSSEResponse(url: string, onToken: (t: string) => void, onDone: () => void) {
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    const es = new EventSource(url);
+    esRef.current = es;
+
+    es.addEventListener('chunk', (e) => {
+      const data = JSON.parse((e as MessageEvent).data);
+      onToken(data.content);
+    });
+
+    es.addEventListener('done', () => {
+      onDone();
+      es.close();
+    });
+
+    es.addEventListener('error', () => {
+      es.close();
+    });
+
+    // Cleanup obrigatório
+    return () => {
+      es.close();
+    };
+  }, [url]);
+
+  return {
+    cancel: () => esRef.current?.close(),
+  };
+}
+```
+
+**Importante:** sempre feche o `EventSource` no cleanup do `useEffect`. Deixar conexões abertas é um leak que degrada performance do browser.
+
+---
+
+## Prática
+
+**Exercício:** Crie o componente `AIResponsePanel` com os quatro estados implementados.
+
+**Passo a passo:**
+
+1. Implemente o reducer `aiReducer` com os estados `idle | loading | streaming | success | error`
+2. Implemente `useAIResponse` com submit, cancel e reset
+3. Crie `AIResponsePanel` que exibe estado visual distinto para cada estado
+4. Use a resposta mockada abaixo para simular o streaming:
+
+```typescript
+// Mock para testes sem API real
+async function mockStreamResponse(
+  onToken: (t: string) => void,
+  onDone: () => void
+) {
+  const tokens = ["Esta ", "é ", "uma ", "resposta ", "simulada."];
+  for (const token of tokens) {
+    await new Promise(resolve => setTimeout(resolve, 150));
+    onToken(token);
+  }
+  onDone();
+}
+```
+
+5. Adicione botão "Regenerar" que chama `reset()` seguido de `submit()`
+6. Valide que cada estado tem `role` ou `aria-label` acessível
+
+**Critérios de validação:**
+- Todos os 4 estados são visualmente distintos
+- Botão "Regenerar" limpa a resposta anterior e faz nova chamada
+- Mensagem de erro não expõe detalhes técnicos
+- Componente funciona com resposta mockada (sem API real)
+
+---
+
+## Checklist de qualidade
+
+- [ ] Estados `idle | loading | streaming | success | error` implementados no reducer
+- [ ] `AbortController` usado para cancelamento (não timeout manual)
+- [ ] `EventSource` ou fetch stream fechado no cleanup do `useEffect`
+- [ ] Mensagens de erro são amigáveis (sem stack traces ao usuário)
+- [ ] Botão "Regenerar" reinicia o estado para `loading`
+- [ ] Fontes são linkadas quando disponíveis
+
+---
+
+> Ver: [FastAPI para features com IA](../../backend/08-fastapi-ai-backend) — o backend que este frontend consome
+
+> Próximo módulo: [Qualidade de UX para IA](../18-ai-ux-quality)

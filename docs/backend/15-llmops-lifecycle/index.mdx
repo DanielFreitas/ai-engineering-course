@@ -1,14 +1,339 @@
 ﻿---
 sidebar_position: 8
 sidebar_label: "LLMOps e ciclo de vida operacional"
-title: "LLMOps e ciclo de vida operacional"
-description: "Módulo 15 do AI Engineering Course."
+title: "LLMOps e ciclo de vida de IA"
+description: "Práticas de LLMOps para gerenciar features de IA em produção — versionamento, rollout gradual, fallback, A/B testing e rollback."
 ---
 
-# LLMOps e ciclo de vida operacional
+# LLMOps e ciclo de vida de IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue definir um plano de rollout para uma feature de IA — com critérios de promoção, métricas de sucesso, critérios de rollback e fallback para o modelo anterior.
+
+---
+
+## Por que LLMOps é diferente de DevOps tradicional
+
+Em DevOps, uma mudança de código tem um comportamento esperado bem definido: testes passam ou falham, lógica é determinística. Em sistemas com LLM, uma mudança de prompt ou de modelo:
+
+- Pode **melhorar algumas consultas e piorar outras** simultaneamente
+- Pode **degradar gradualmente** sem falha explícita
+- Tem **impacto de custo** imediato (tokens por requisição podem dobrar)
+- Não tem "teste unitário" que valide todos os casos
+
+Por isso, **LLMOps** é a disciplina de gerenciar esse ciclo de vida com segurança:
+
+```
+Desenvolvimento → Avaliação → Rollout gradual → Monitoramento → Rollback ou promoção
+```
+
+---
+
+## Versionamento de prompts e modelos
+
+Todo artefato de IA é versionado com semver:
+
+```
+prompts/
+├── sentiment_v1.0.0.txt    # em produção (100% do tráfego)
+├── sentiment_v1.1.0.txt    # em rollout (10% do tráfego)
+└── CHANGELOG.md
+```
+
+```markdown
+# CHANGELOG — sentiment prompt
+
+## v1.1.0 (2026-04-08)
+- Adicionado few-shot com 3 exemplos negativos
+- Testado: accuracy 87% → 91% no dataset de avaliação
+- Troca: 45 tokens de resposta → 52 tokens (+15% custo)
+- Ticket: AI-234
+
+## v1.0.0 (2026-03-01)
+- Versão inicial
+```
+
+O código de serviço lê a versão ativa de configuração — não precisa de redeploy para mudar de versão:
+
+```python
+# config.py
+import os
+
+class PromptConfig:
+    SENTIMENT_VERSION: str = os.environ.get("SENTIMENT_PROMPT_VERSION", "v1.0.0")
+
+    @classmethod
+    def load_prompt(cls, name: str) -> str:
+        """Carrega o prompt da versão configurada."""
+        path = f"prompts/{name}_{cls.SENTIMENT_VERSION}.txt"
+        return open(path, encoding="utf-8").read()
+```
+
+---
+
+## Rollout gradual: feature flags e traffic splitting
+
+O rollout ideal segue rampas progressivas com gates de qualidade:
+
+```
+Canary 1% → Validar 24h → 10% → Validar 48h → 50% → Validar 48h → 100%
+```
+
+Implementação com feature flag simples:
+
+```python
+# feature_flags.py
+import hashlib
+
+class TrafficRouter:
+    def __init__(self, config: dict):
+        """
+        config exemplo:
+        {
+          "sentiment": {
+            "v1.0.0": 0.90,   # 90% do tráfego
+            "v1.1.0": 0.10,   # 10% do tráfego
+          }
+        }
+        """
+        self._config = config
+
+    def get_prompt_version(self, feature: str, user_id: str) -> str:
+        """
+        Determina qual versão do prompt serve esse user_id.
+        Determinístico: o mesmo user_id sempre recebe a mesma versão.
+        """
+        variants = self._config.get(feature, {})
+        if not variants:
+            return "v1.0.0"  # fallback seguro
+
+        # Hash do user_id para distribuição estável
+        bucket = int(hashlib.md5(user_id.encode()).hexdigest(), 16) % 100
+
+        cumulative = 0
+        for version, percentage in sorted(variants.items()):
+            cumulative += int(percentage * 100)
+            if bucket < cumulative:
+                return version
+
+        return list(variants.keys())[-1]
+```
+
+---
+
+## Fallback: quando o modelo principal falha
+
+```python
+# services/resilient_llm_service.py
+import logging
+from openai import RateLimitError, APITimeoutError
+
+logger = logging.getLogger(__name__)
+
+class ResilientLLMService:
+    def __init__(self, primary_client, fallback_client):
+        self._primary = primary_client    # ex: gpt-4o
+        self._fallback = fallback_client  # ex: gpt-4o-mini
+
+    async def complete_with_fallback(self, system: str, user: str) -> tuple[str, str]:
+        """
+        Retorna (conteúdo, provider_usado).
+        Tenta o modelo primário. Em falha transitória, usa o fallback.
+        """
+        try:
+            content, _ = await self._primary.complete(system, user)
+            return content, "primary"
+        except (RateLimitError, APITimeoutError) as e:
+            logger.warning("primary_model_fallback", extra={"reason": str(e)})
+            content, _ = await self._fallback.complete(system, user)
+            return content, "fallback"
+```
+
+**Regra crítica:** fallback sempre aponta para uma versão **testada e conhecida** — nunca para "qualquer modelo disponível". O fallback é parte do contrato de qualidade.
+
+---
+
+## A/B testing com LLMs
+
+```python
+# ab_testing/experiment.py
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+@dataclass
+class ABTestVariant:
+    id: str
+    prompt_version: str
+    traffic_pct: float  # 0.0 a 1.0
+
+class ABTest:
+    def __init__(self, test_id: str, variants: list[ABTestVariant]):
+        assert sum(v.traffic_pct for v in variants) == 1.0, "Variantes devem somar 100%"
+        self.test_id = test_id
+        self.variants = variants
+
+    def assign_variant(self, user_id: str) -> ABTestVariant:
+        """Atribuição determinística por user_id."""
+        import hashlib
+        bucket = int(hashlib.md5(f"{self.test_id}:{user_id}".encode()).hexdigest(), 16) % 1000
+        cumulative = 0
+        for variant in self.variants:
+            cumulative += int(variant.traffic_pct * 1000)
+            if bucket < cumulative:
+                return variant
+        return self.variants[-1]
+```
+
+**Métricas mínimas para um A/B test de LLM:**
+- Taxa de erro (`status_code != 200`)
+- Latência p95
+- Tokens por requisição (custo proxy)
+- Taxa de regeneração (sinal de qualidade percebida)
+- Score de avaliação automática (se disponível)
+
+> Ver: [Avaliação de LLMs](../../core/05-llm-evaluation) para avaliar qualidade offline antes do rollout.
+
+---
+
+## Critérios de rollback
+
+Documente os critérios antes do rollout — não depois:
+
+```yaml
+# rollout-plan.yaml
+feature: sentiment_analysis
+prompt_version: v1.1.0
+previous_version: v1.0.0
+
+promotion_criteria:
+  - metric: error_rate
+    threshold: "<1%"
+    window: "24h"
+  - metric: latency_p95_ms
+    threshold: "<3000"
+    window: "24h"
+  - metric: tokens_per_request
+    threshold: "<600"
+    window: "24h"
+
+rollback_criteria:
+  - metric: error_rate
+    threshold: ">3%"
+    window: "15m"
+  - metric: latency_p95_ms
+    threshold: ">8000"
+    window: "30m"
+
+rollback_procedure:
+  - action: "Definir SENTIMENT_PROMPT_VERSION=v1.0.0 via feature flag"
+  - action: "Notificar canal #ai-incidents"
+  - action: "Criar post-mortem em 24h"
+  sla: "< 5 minutos"
+
+fallback_target: "v1.0.0 (validado em produção desde 2026-03-01)"
+```
+
+---
+
+## Custo como critério arquitetural
+
+Custo não é uma preocupação secundária — é uma métrica de primeiro nível:
+
+```python
+# Exemplo: monitorar custo por feature antes de aprovar rollout
+def analyze_cost_impact(
+    baseline_tokens_per_request: float,  # média da v1.0.0
+    new_tokens_per_request: float,       # média da v1.1.0
+    requests_per_day: int,
+    cost_per_1k_tokens: float = 0.0025,
+) -> dict:
+    baseline_daily = (requests_per_day * baseline_tokens_per_request / 1000) * cost_per_1k_tokens
+    new_daily = (requests_per_day * new_tokens_per_request / 1000) * cost_per_1k_tokens
+
+    return {
+        "baseline_daily_usd": round(baseline_daily, 2),
+        "new_daily_usd": round(new_daily, 2),
+        "delta_usd": round(new_daily - baseline_daily, 2),
+        "delta_pct": round(((new_daily - baseline_daily) / baseline_daily) * 100, 1),
+    }
+
+# Antes de promover v1.1.0 de 10% → 100%:
+impact = analyze_cost_impact(
+    baseline_tokens_per_request=450,
+    new_tokens_per_request=520,
+    requests_per_day=50_000,
+)
+# {'baseline_daily_usd': 56.25, 'new_daily_usd': 65.0, 'delta_usd': 8.75, 'delta_pct': 15.6}
+```
+
+Um aumento de 15% de custo sem melhora equivalente de qualidade é um critério válido para **não** promover a versão.
+
+---
+
+## Prática
+
+**Exercício:** Para uma feature de IA existente (real ou simulada), defina um plano de rollout que inclua critérios de promoção, métricas de sucesso, critérios de rollback e fallback.
+
+**Template de plano** (preencha para sua feature):
+
+```yaml
+feature: [nome da feature]
+prompt_version: [nova versão]
+previous_version: [versão atual em produção]
+
+ramp_schedule:
+  - percentage: 1%
+    duration: "24h"
+  - percentage: 10%
+    duration: "48h"
+  - percentage: 50%
+    duration: "48h"
+  - percentage: 100%
+    duration: "permanente"
+
+promotion_criteria:
+  - metric: [métrica 1]
+    threshold: [valor]
+    window: [janela de tempo]
+  # adicione pelo menos 3 critérios, incluindo custo
+
+rollback_criteria:
+  - metric: [métrica]
+    threshold: [valor de alarme]
+    window: [janela]
+
+rollback_procedure:
+  - action: [ação 1 — como reverter em < 5 min]
+  - action: [ação 2 — notificação]
+
+fallback_target: [versão específica testada]
+cost_impact:
+  baseline_tokens_per_request: [N]
+  new_tokens_per_request: [N]
+  acceptable_delta_pct: [N]%
+```
+
+**Critérios de validação:**
+- Plano inclui critérios quantitativos de promoção
+- Critérios de rollback são objetivos e automatizáveis
+- Fallback aponta para uma versão testada específica
+- Custo por requisição faz parte do plano
+
+---
+
+## Checklist de qualidade
+
+- [ ] Toda mudança de prompt tem versão semver e changelog
+- [ ] Feature flags controlam qual versão serve cada segmento de tráfego
+- [ ] Rollback pode ser executado em menos de 5 minutos
+- [ ] Métricas de sucesso são definidas antes do rollout
+- [ ] Custo por requisição é monitorado como métrica de primeiro nível
+- [ ] Fallback aponta para uma versão testada e conhecida
+
+---
+
+> Ampliação de: [Avaliação de LLMs](../../core/05-llm-evaluation)
+
+> Próximo módulo: [Segurança Operacional de IA](../16-operational-security)

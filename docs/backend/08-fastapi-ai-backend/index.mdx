@@ -2,13 +2,358 @@
 sidebar_position: 1
 sidebar_label: "FastAPI para features com IA"
 title: "FastAPI para features com IA"
-description: "Módulo 08 do AI Engineering Course."
+description: "Como estruturar um serviço backend com IA usando FastAPI — contratos Pydantic, separação de camadas, tratamento de erros e versionamento de prompts."
 ---
 
 # FastAPI para features com IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue criar um endpoint FastAPI funcional que integra um LLM como componente — com contratos de entrada e saída validados, chamada ao modelo isolada em camada de serviço, tratamento de erros mapeados para HTTP status codes e tempo de processamento medido.
+
+---
+
+## O que diferencia um backend de IA de um backend tradicional
+
+Um endpoint REST convencional executa lógica determinística: busca no banco, calcula, retorna. A latência é previsível e os erros são reproduzíveis.
+
+Um endpoint de IA tem características diferentes:
+
+| Dimensão | Backend tradicional | Backend com IA |
+|---|---|---|
+| Latência | Milissegundos | 1–10 segundos |
+| Saída | Determinística | Probabilística |
+| Custo | CPU/memória | Tokens por requisição |
+| Teste | Input/output fixo | Avaliação é uma distribuição |
+| Erros | Stack trace claro | Falhas parciais, outputs inválidos |
+
+Isso não complica o design — mas exige decisões explícitas em três áreas: **estrutura de camadas**, **contratos de API** e **tratamento de erros**.
+
+> Ver: [Fundamentos de aplicações com IA](../../core/01-ai-fundamentals)
+
+---
+
+## Estrutura de camadas
+
+A separação de responsabilidades é o princípio mais importante neste módulo. O motivo: chamadas a LLMs são caras, lentas e não-determinísticas. Se a lógica de negócio e a chamada ao modelo estiverem misturadas no mesmo lugar, qualquer manutenção vira um risco.
+
+A estrutura canônica do curso é:
+
+```
+app/
+├── routers/
+│   └── analysis.py         # recebe HTTP, valida com Pydantic
+├── services/
+│   └── analysis_service.py # lógica de negócio e orquestração
+├── clients/
+│   └── llm_client.py       # abstração do provedor de LLM
+├── models/
+│   ├── requests.py         # modelos de entrada
+│   └── responses.py        # modelos de saída
+└── prompts/
+    └── sentiment_v1.0.txt  # arquivos de prompt versionados
+```
+
+Cada camada tem uma única responsabilidade:
+
+- **Router:** recebe a requisição HTTP, valida com Pydantic, chama o service, retorna HTTP response. Nada de lógica de IA aqui.
+- **Service:** orquestra o fluxo — carrega o prompt, prepara o contexto, chama o LLM client, processa a resposta, mede o tempo.
+- **LLM Client:** encapsula a chamada ao provedor. Qualquer troca de provedor acontece aqui sem afetar as outras camadas.
+
+> Decisão arquitetural: ADR-006 em `.github/architecture-decisions.md` — toda chamada de modelo deve estar isolada em camada de serviço.
+
+---
+
+## Contratos com Pydantic v2
+
+Contratos explícitos são o que separa um serviço de produção de um script. O FastAPI usa Pydantic nativamente — o `response_model` do decorator valida a saída antes de retornar ao cliente.
+
+```python
+# models/requests.py
+from pydantic import BaseModel, Field
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+    language: str = "pt-BR"
+```
+
+```python
+# models/responses.py
+from pydantic import BaseModel
+from typing import Literal
+
+class AnalyzeResponse(BaseModel):
+    sentiment: Literal["positive", "negative", "neutral"]
+    confidence: float  # 0.0 a 1.0
+    processing_time_ms: int
+    model_used: str
+    prompt_version: str
+```
+
+```python
+# models/responses.py (continuação)
+class ErrorDetail(BaseModel):
+    code: str      # ex: "LLM_UNAVAILABLE"
+    message: str   # mensagem segura para o cliente
+    request_id: str
+```
+
+O modelo `AnalyzeResponse` define o contrato: o service é obrigado a retornar exatamente esses campos com esses tipos. Se a resposta do LLM não for parseável para esse schema, o erro acontece no service — não chega ao cliente como resposta inválida.
+
+---
+
+## Exemplo: endpoint completo de análise de sentimento
+
+### LLM Client
+
+```python
+# clients/llm_client.py
+import time
+from openai import AsyncOpenAI, RateLimitError, APITimeoutError
+from fastapi import HTTPException
+
+class LLMClient:
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        self._client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+
+    async def complete(self, system: str, user: str) -> tuple[str, dict]:
+        """Retorna (conteúdo, uso). Lança HTTPException em falha."""
+        try:
+            response = await self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+            }
+            return content, usage
+        except RateLimitError:
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT", "message": "Serviço temporariamente indisponível."})
+        except APITimeoutError:
+            raise HTTPException(status_code=504, detail={"code": "LLM_TIMEOUT", "message": "Tempo limite da análise excedido."})
+        except Exception:
+            raise HTTPException(status_code=500, detail={"code": "LLM_ERROR", "message": "Erro interno na análise."})
+```
+
+### Service
+
+```python
+# services/analysis_service.py
+import json
+import time
+from pathlib import Path
+from clients.llm_client import LLMClient
+from models.responses import AnalyzeResponse
+
+# Prompt carregado no boot da aplicação — não a cada requisição
+_SYSTEM_PROMPT = Path("prompts/sentiment_v1.0.txt").read_text(encoding="utf-8")
+PROMPT_VERSION = "v1.0.0"
+
+class AnalysisService:
+    def __init__(self, llm_client: LLMClient):
+        self._llm = llm_client
+
+    async def analyze_sentiment(self, text: str, model_name: str) -> AnalyzeResponse:
+        start = time.monotonic()
+
+        raw, _usage = await self._llm.complete(
+            system=_SYSTEM_PROMPT,
+            user=f"Texto para análise:\n{text}",
+        )
+
+        # Valida a resposta estruturada do modelo
+        data = json.loads(raw)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        return AnalyzeResponse(
+            sentiment=data["sentiment"],
+            confidence=float(data["confidence"]),
+            processing_time_ms=elapsed_ms,
+            model_used=model_name,
+            prompt_version=PROMPT_VERSION,
+        )
+```
+
+### Router
+
+```python
+# routers/analysis.py
+from fastapi import APIRouter, Depends
+from models.requests import AnalyzeRequest
+from models.responses import AnalyzeResponse
+from services.analysis_service import AnalysisService
+from dependencies import get_analysis_service  # injeção de dependência
+
+router = APIRouter(prefix="/api/v1", tags=["analysis"])
+
+@router.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    request: AnalyzeRequest,
+    service: AnalysisService = Depends(get_analysis_service),
+) -> AnalyzeResponse:
+    return await service.analyze_sentiment(
+        text=request.text,
+        model_name="gpt-4o",
+    )
+```
+
+### Injeção de dependência
+
+```python
+# dependencies.py
+import os
+from functools import lru_cache
+from clients.llm_client import LLMClient
+from services.analysis_service import AnalysisService
+
+@lru_cache(maxsize=1)
+def get_llm_client() -> LLMClient:
+    return LLMClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+def get_analysis_service() -> AnalysisService:
+    return AnalysisService(llm_client=get_llm_client())
+```
+
+### Arquivo de prompt (`prompts/sentiment_v1.0.txt`)
+
+```
+Você é um analisador de sentimento. Retorne APENAS JSON com este schema:
+{"sentiment": "positive"|"negative"|"neutral", "confidence": 0.0-1.0}
+
+Regras:
+- "sentiment" deve ser exatamente uma dessas três opções
+- "confidence" é um float entre 0 e 1 indicando sua certeza
+- Não adicione explicações fora do JSON
+```
+
+---
+
+## Versionamento de prompts
+
+Prompts são artefatos de software — precisam de versionamento como código. A convenção do curso:
+
+```
+prompts/
+├── sentiment_v1.0.txt    # versão estável em produção
+├── sentiment_v1.1.txt    # versão em teste
+└── CHANGELOG.md          # o que mudou e por quê
+```
+
+O nome do arquivo inclui a versão (`v1.0`) e o service carrega a versão configurada via variável de ambiente ou constante. Isso permite troca de prompt sem alterar código de negócio.
+
+> Ver: [LLMOps e Ciclo de Vida](../15-llmops-lifecycle) para estratégias de rollout de prompts.
+
+---
+
+## Tratamento de erros
+
+O mapeamento entre erros do SDK do provedor e HTTP status codes deve ser explícito:
+
+| Erro interno | HTTP Status | Código retornado |
+|---|---|---|
+| `RateLimitError` | 429 | `RATE_LIMIT` |
+| `APITimeoutError` | 504 | `LLM_TIMEOUT` |
+| `InvalidRequestError` | 400 | `INVALID_INPUT` |
+| `ContentFilterError` | 422 | `CONTENT_FILTERED` |
+| `Exception` genérica | 500 | `LLM_ERROR` |
+
+**Regra crítica:** erros internos do SDK (mensagens de stack trace, chaves de API) nunca chegam ao cliente. O mapeamento acontece no LLM Client, não no router.
+
+---
+
+## Endpoint de saúde para IA
+
+Um `/health` genérico que verifica apenas se o servidor está de pé é insuficiente. Em serviços de IA, o servidor pode estar operacional mas o modelo inacessível.
+
+```python
+@router.get("/health/ai")
+async def health_ai(client: LLMClient = Depends(get_llm_client)):
+    """Verifica conectividade com o provedor de LLM."""
+    try:
+        # Chamada mínima para validar conectividade
+        await client.complete(system="ping", user="pong")
+        return {"status": "ok", "llm_reachable": True}
+    except Exception:
+        return {"status": "degraded", "llm_reachable": False}
+```
+
+---
+
+## Prática
+
+**Exercício:** Crie um endpoint `POST /analyze` que receba `{"text": "..."}`, chame um LLM para classificar o sentimento, e retorne `{"sentiment": "...", "confidence": 0.0–1.0, "processing_time_ms": int}`.
+
+**Passo a passo:**
+
+1. Crie os modelos Pydantic `AnalyzeRequest` e `AnalyzeResponse`
+2. Implemente o `LLMClient` com tratamento de `RateLimitError` e `APITimeoutError`
+3. Implemente o `AnalysisService` que carrega o prompt de arquivo e chama o cliente
+4. Crie o router com `POST /analyze` usando `response_model=AnalyzeResponse`
+5. Configure a injeção de dependência com `Depends`
+6. Escreva um teste com LLM mockado que valida o contrato de saída
+
+**Critérios de validação:**
+- O endpoint usa Pydantic para validar entrada e saída
+- A chamada ao LLM está no `LLMClient`, não no router
+- O endpoint retorna HTTP 200 com resposta válida ou 429/504/500 em erro
+- O tempo de processamento é medido e retornado
+- O teste passa sem fazer chamada real à API
+
+**Dica:** para mockar o `LLMClient` no teste:
+
+```python
+# test_analysis.py
+import pytest
+from unittest.mock import AsyncMock, patch
+from fastapi.testclient import TestClient
+from main import app
+
+@pytest.fixture
+def mock_llm_response():
+    return ('{"sentiment": "positive", "confidence": 0.92}', {})
+
+def test_analyze_returns_sentiment(mock_llm_response):
+    with patch("services.analysis_service.LLMClient.complete",
+               new_callable=AsyncMock, return_value=mock_llm_response):
+        client = TestClient(app)
+        response = client.post("/api/v1/analyze", json={"text": "Produto excelente!"})
+        assert response.status_code == 200
+        assert response.json()["sentiment"] == "positive"
+        assert "processing_time_ms" in response.json()
+```
+
+---
+
+## Armadilhas comuns
+
+| Anti-padrão | Consequência | Correção |
+|---|---|---|
+| Lógica de IA no router | Impossível de testar isoladamente | Mover para service |
+| Cliente instanciado por requisição | Desperdício de recursos | Usar `lru_cache` ou DI |
+| Prompt hardcoded no service | Re-deploy a cada ajuste de prompt | Carregar de arquivo |
+| `try/except` genérico silencioso | Erros invisíveis | Mapear explicitamente |
+| Sem `response_model` no endpoint | Sem validação de saída | Sempre usar `response_model` |
+
+---
+
+## Checklist de qualidade
+
+- [ ] Modelos Pydantic definem contratos de entrada e saída
+- [ ] LLM Client é injetado via `Depends`, não instanciado no endpoint
+- [ ] Erros do provedor são mapeados para HTTP status codes com mensagens seguras
+- [ ] Prompts estão em arquivos com versão no nome, carregados no boot
+- [ ] O endpoint tem pelo menos um teste com LLM mockado
+- [ ] `response_model` está presente em todos os endpoints de IA
+- [ ] `/health/ai` valida conectividade com o provedor
+
+---
+
+> Próximo módulo: [Contexto, Memória e Estado Conversacional](../09-context-memory-state)

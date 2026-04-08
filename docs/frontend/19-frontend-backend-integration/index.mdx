@@ -1,14 +1,395 @@
 ﻿---
 sidebar_position: 3
 sidebar_label: "Integração frontend-backend para fluxos com IA"
-title: "Integração frontend-backend para fluxos com IA"
-description: "Módulo 19 do AI Engineering Course."
+title: "Integração Frontend-Backend para IA"
+description: "Protocolos e padrões para integrar frontend com backend em fluxos de IA — SSE, WebSocket, polling, cancelamento com AbortController e re-execução."
 ---
 
-# Integração frontend-backend para fluxos com IA
+# Integração Frontend-Backend para IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue implementar pelo menos dois protocolos de integração (SSE e polling), sabe quando usar cada um e implementa cancelamento e re-execução no frontend.
+
+---
+
+## Por que HTTP request-response não é suficiente para IA
+
+Uma chamada de LLM demora entre 1 e 30 segundos, e pode retornar resultados parciais progressivamente. Um POST clássico bloquearia a thread ou expiraria antes da resposta completa. As soluções são:
+
+| Protocolo | Direção | Quando usar |
+|---|---|---|
+| **SSE** | Servidor → Cliente (unidirecional) | Streaming de tokens; baixa complexidade |
+| **WebSocket** | Bidirecional | Agentes interativos; input do usuário durante geração |
+| **Polling** | Cliente pergunta periodicamente | Tarefas de background sem streaming |
+| **Long-polling** | Cliente espera até ter resposta | Legado; evitar em novos sistemas |
+
+**Regra do curso:** SSE para streaming de texto; polling para tarefas assíncronas de longa duração. WebSocket apenas quando bidirecionalidade é necessária.
+
+---
+
+## SSE no frontend
+
+```typescript
+// hooks/useSSEStream.ts
+import { useEffect, useRef, useCallback } from 'react';
+
+interface UseSSEStreamOptions {
+  url: string;
+  onToken: (token: string) => void;
+  onDone: () => void;
+  onError: (msg: string) => void;
+  enabled: boolean;
+}
+
+export function useSSEStream({
+  url, onToken, onDone, onError, enabled,
+}: UseSSEStreamOptions) {
+  const esRef = useRef<EventSource | null>(null);
+
+  const close = useCallback(() => {
+    esRef.current?.close();
+    esRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    const es = new EventSource(url);
+    esRef.current = es;
+
+    es.addEventListener('chunk', (e: MessageEvent) => {
+      const data = JSON.parse(e.data);
+      onToken(data.content);
+    });
+
+    es.addEventListener('done', () => {
+      onDone();
+      es.close();
+    });
+
+    es.addEventListener('error', (e: Event) => {
+      const msg = (e as MessageEvent).data
+        ? JSON.parse((e as MessageEvent).data).message
+        : 'Erro de conexão.';
+      onError(msg);
+      es.close();
+    });
+
+    // Cleanup obrigatório — evita leak de conexão
+    return () => {
+      es.close();
+    };
+  }, [url, enabled]);
+
+  return { cancel: close };
+}
+```
+
+**Nota:** `EventSource` não suporta `POST` nativamente. Para enviar corpo JSON, use `fetch` com `ReadableStream` (como no módulo 17).
+
+---
+
+## Polling para tarefas assíncronas
+
+Quando o backend processa uma tarefa pesada (geração de relatório, re-indexação, transcrição), retorna imediatamente um `task_id` e o frontend consulta o status periodicamente.
+
+```
+POST /api/v1/reports/generate  →  202 { task_id: "abc-123" }
+GET  /api/v1/tasks/abc-123     →  200 { status: "processing", progress: 42 }
+GET  /api/v1/tasks/abc-123     →  200 { status: "completed", result_url: "..." }
+```
+
+```typescript
+// hooks/useTaskPolling.ts
+import { useState, useEffect, useRef, useCallback } from 'react';
+
+type TaskStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+
+interface Task {
+  status: TaskStatus;
+  progress?: number;
+  message?: string;
+  result?: unknown;
+}
+
+interface UseTaskPollingOptions {
+  taskId: string | null;
+  intervalMs?: number;
+  maxWaitMs?: number;
+  onComplete?: (result: unknown) => void;
+  onError?: (msg: string) => void;
+}
+
+export function useTaskPolling({
+  taskId,
+  intervalMs = 2000,
+  maxWaitMs = 120_000,
+  onComplete,
+  onError,
+}: UseTaskPollingOptions) {
+  const [task, setTask] = useState<Task | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startTimeRef = useRef<number>(Date.now());
+  const cancelledRef = useRef(false);
+
+  const stopPolling = useCallback(() => {
+    cancelledRef.current = true;
+    if (timerRef.current) clearTimeout(timerRef.current);
+  }, []);
+
+  const cancelTask = useCallback(async () => {
+    if (!taskId) return;
+    stopPolling();
+    setTask(prev => prev ? { ...prev, status: 'cancelled' } : null);
+    try {
+      await fetch(`/api/v1/tasks/${taskId}/cancel`, { method: 'POST' });
+    } catch {
+      // best-effort
+    }
+  }, [taskId, stopPolling]);
+
+  useEffect(() => {
+    if (!taskId) return;
+
+    cancelledRef.current = false;
+    startTimeRef.current = Date.now();
+
+    async function poll() {
+      if (cancelledRef.current) return;
+
+      try {
+        const res = await fetch(`/api/v1/tasks/${taskId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const data: Task = await res.json();
+        setTask(data);
+
+        if (data.status === 'completed') {
+          onComplete?.(data.result);
+          return;
+        }
+        if (data.status === 'failed') {
+          onError?.(data.message ?? 'Tarefa falhou.');
+          return;
+        }
+
+        const elapsed = Date.now() - startTimeRef.current;
+        if (elapsed >= maxWaitMs) {
+          onError?.('Tempo máximo de espera atingido.');
+          return;
+        }
+
+        // Agendar próximo poll
+        timerRef.current = setTimeout(poll, intervalMs);
+      } catch (err) {
+        if (!cancelledRef.current) {
+          onError?.('Erro ao verificar status da tarefa.');
+        }
+      }
+    }
+
+    poll();
+
+    return () => {
+      cancelledRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, [taskId, intervalMs, maxWaitMs]);
+
+  return { task, cancelTask };
+}
+```
+
+---
+
+## Cancelamento com `AbortController`
+
+Para requisições `fetch` (incluindo streaming):
+
+```typescript
+// hooks/useCancellableFetch.ts
+import { useRef, useCallback } from 'react';
+
+export function useCancellableFetch() {
+  const controllerRef = useRef<AbortController | null>(null);
+
+  const fetchWithCancel = useCallback(async (
+    url: string,
+    options: RequestInit = {},
+  ) => {
+    // Cancela requisição anterior
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+
+    return fetch(url, { ...options, signal: controller.signal });
+  }, []);
+
+  const cancel = useCallback(() => {
+    controllerRef.current?.abort();
+  }, []);
+
+  return { fetchWithCancel, cancel };
+}
+```
+
+**Diferença entre SSE e fetch:**
+
+| | `EventSource` | `fetch` com `ReadableStream` |
+|---|---|---|
+| Suporta POST | Não | Sim |
+| Reconexão automática | Sim | Não |
+| Cancelamento | `es.close()` | `controller.abort()` |
+| Headers customizados | Limitado | Completo |
+
+---
+
+## Componente completo: "Gerar Relatório"
+
+```tsx
+// components/ReportGenerator.tsx
+import { useState, useCallback } from 'react';
+import { useTaskPolling } from '../hooks/useTaskPolling';
+
+export function ReportGenerator() {
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const { task, cancelTask } = useTaskPolling({
+    taskId,
+    intervalMs: 2000,
+    maxWaitMs: 120_000,
+    onComplete: (r) => setResult(r as string),
+    onError: (msg) => setError(msg),
+  });
+
+  const startReport = useCallback(async () => {
+    setResult(null);
+    setError(null);
+
+    try {
+      const res = await fetch('/api/v1/reports/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'monthly_summary' }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data = await res.json();
+      setTaskId(data.task_id);
+    } catch {
+      setError('Não foi possível iniciar o relatório.');
+    }
+  }, []);
+
+  const progressLabel = task?.progress != null
+    ? `${task.progress}%`
+    : task?.status ?? 'Aguardando...';
+
+  return (
+    <div className="report-generator">
+      {!task && !result && (
+        <button onClick={startReport}>Gerar Relatório</button>
+      )}
+
+      {task && (task.status === 'pending' || task.status === 'processing') && (
+        <div role="status">
+          <p>Gerando relatório: {progressLabel}</p>
+          <div className="progress-bar" style={{ width: `${task.progress ?? 0}%` }} />
+          <button onClick={cancelTask}>Cancelar</button>
+        </div>
+      )}
+
+      {task?.status === 'cancelled' && (
+        <div>
+          <p>Geração cancelada.</p>
+          <button onClick={startReport}>Tentar novamente</button>
+        </div>
+      )}
+
+      {result && (
+        <div>
+          <p>Relatório pronto.</p>
+          <a href={result} download>Baixar relatório</a>
+          <button onClick={startReport}>Gerar outro</button>
+        </div>
+      )}
+
+      {error && (
+        <div role="alert">
+          <p>{error}</p>
+          <button onClick={startReport}>Tentar novamente</button>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## Comparação de decisão: qual protocolo?
+
+| Pergunta | SSE | WebSocket | Polling |
+|---|---|---|---|
+| Só servidor envia? | ✅ ideal | funciona | funciona |
+| Usuário precisa enviar durante a geração? | ❌ | ✅ ideal | ❌ |
+| Resultado disponível após processamento? | ❌ | ❌ | ✅ ideal |
+| Infra tem restrições de WebSocket? | ✅ não afeta | ❌ requer suporte | ✅ não afeta |
+| Baixa latência obrigatória? | ✅ | ✅ | ❌ latência do intervalo |
+
+---
+
+## Prática
+
+**Exercício:** Implemente o fluxo "Gerar Relatório" com as seguintes etapas:
+
+1. Botão "Gerar Relatório" inicia a tarefa via `POST /api/v1/reports/generate`
+2. Frontend recebe `task_id` e começa a fazer polling a cada 2 segundos
+3. Exibe progresso visualmente enquanto `status === "processing"`
+4. Quando `status === "completed"`, exibe o resultado
+5. Botão "Cancelar" para o polling e envia `POST /api/v1/tasks/{id}/cancel`
+
+Use o mock abaixo para simular o backend sem API real:
+
+```typescript
+// Mock de progress para testes
+let mockProgress = 0;
+
+async function mockFetchTask(taskId: string) {
+  mockProgress = Math.min(mockProgress + 20, 100);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  if (mockProgress >= 100) {
+    mockProgress = 0;
+    return { status: 'completed', result: '/downloads/report.pdf' };
+  }
+  return { status: 'processing', progress: mockProgress };
+}
+```
+
+**Critérios de validação:**
+- Frontend não bloqueia enquanto aguarda a tarefa
+- Status é atualizado visualmente a cada poll
+- Botão "Cancelar" para o polling e envia cancelamento ao backend
+- Resultado é exibido quando a tarefa conclui
+
+---
+
+## Checklist de qualidade
+
+- [ ] Protocolo escolhido é justificado (não escolhido por padrão)
+- [ ] Cancelamento libera recursos no cliente E notifica o servidor
+- [ ] Erros de rede são tratados com retry ou mensagem ao usuário
+- [ ] Estado da UI é consistente com o estado do backend
+- [ ] Timeout máximo de espera é definido e comunicado ao usuário
+
+---
+
+> Ver: [Pub/Sub e processamento assíncrono](../../backend/12-pubsub-async) — o backend que publica os status
+
+> Ver: [Frontend React para IA](../17-react-ai-frontend) — o componente que exibe os resultados
+
+> Próximo módulo: [Telemetria orientada à experiência](../20-experience-telemetry)

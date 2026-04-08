@@ -2,13 +2,317 @@
 sidebar_position: 7
 sidebar_label: "Observabilidade com OpenTelemetry e Datadog"
 title: "Observabilidade com OpenTelemetry e Datadog"
-description: "Módulo 14 do AI Engineering Course."
+description: "Como instrumentar sistemas de IA com OpenTelemetry — traces, spans em chamadas ao modelo, logs estruturados, métricas e dashboards no Datadog."
 ---
 
 # Observabilidade com OpenTelemetry e Datadog
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue instrumentar uma chamada de LLM com um span OpenTelemetry contendo modelo, tokens e latência — e exportar o trace para um coletor local, validando que os atributos aparecem corretamente.
+
+---
+
+## O que você não consegue depurar sem observabilidade
+
+| Pergunta | Sem observabilidade | Com observabilidade |
+|---|---|---|
+| Por que essa requisição demorou 8 segundos? | Chute | Trace mostra que a busca vetorial levou 6s |
+| Qual feature está custando mais? | Planilha de estimativas | Soma de `llm.cost.usd` por `feature` |
+| O modelo piorou após a atualização? | Reclamações de usuários | Comparação de métricas antes/depois |
+| Qual erro está mais frequente? | Procura manual em logs | Dashboard com contagem por tipo |
+
+Sistemas de IA adicionam uma camada de complexidade: **não-determinismo** e **custo por uso**. Um endpoint pode ser "saudável" do ponto de vista de latência HTTP enquanto gera respostas ruins ou gasta 10× o esperado em tokens.
+
+---
+
+## Conceitos fundamentais
+
+### Trace e Span
+
+**Trace** é o registro completo de uma requisição, do início ao fim — mesmo que atravesse múltiplos serviços.
+
+**Span** é uma operação dentro do trace: "chamada ao LLM", "busca no banco", "serialização da resposta". Spans têm:
+- Nome, horário de início e duração
+- Atributos (pares chave-valor)
+- Status (OK ou ERROR)
+- Eventos (momentos pontuais dentro do span)
+
+```
+[trace: POST /analyze — 2.1s]
+├── [span: request_validation — 3ms]
+├── [span: llm.generate — 1.9s]        ← span dedicado ao modelo
+│   └── [event: first_token — +320ms]
+└── [span: response_serialization — 5ms]
+```
+
+### Logs estruturados
+
+Logs em texto livre são difíceis de correlacionar com traces. Logs em JSON com `trace_id` injetado automaticamente permitem ir do trace para o log e vice-versa:
+
+```json
+{
+  "timestamp": "2026-04-08T10:30:00Z",
+  "severity": "INFO",
+  "message": "llm_call_completed",
+  "trace": {"trace_id": "8a3f2c...", "span_id": "1b2c3d..."},
+  "context": {"session_id": "uuid-xxx", "feature": "sentiment_analysis"},
+  "llm": {"model": "gpt-4o", "tokens": 768, "latency_ms": 1900}
+}
+```
+
+---
+
+## Instrumentando uma chamada de LLM
+
+### Instalação
+
+```bash
+pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+# Para exportar para Jaeger local:
+pip install opentelemetry-exporter-jaeger
+```
+
+### Configuração do tracer
+
+```python
+# observability/tracing.py
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+def setup_tracing(service_name: str, otlp_endpoint: str = "http://localhost:4318") -> None:
+    """Configura OpenTelemetry para exportar traces via OTLP."""
+    provider = TracerProvider()
+    exporter = OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces")
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer("ai-service")
+```
+
+### LLM Client instrumentado
+
+```python
+# clients/instrumented_llm_client.py
+import time
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("llm-client")
+
+# Custo estimado por 1k tokens GPT-4o (verifique openai.com/pricing)
+COST_PER_1K_INPUT_TOKENS = 0.0025
+COST_PER_1K_OUTPUT_TOKENS = 0.010
+
+class InstrumentedLLMClient:
+    def __init__(self, client, model: str = "gpt-4o"):
+        self._client = client
+        self.model = model
+
+    async def complete(self, system: str, user: str) -> tuple[str, dict]:
+        with tracer.start_as_current_span("llm.generate") as span:
+            # Atributos antes da chamada
+            span.set_attribute("gen_ai.system", "openai")
+            span.set_attribute("gen_ai.request.model", self.model)
+
+            start = time.monotonic()
+            first_token_time = None
+
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+
+                latency_ms = int((time.monotonic() - start) * 1000)
+                usage = response.usage
+
+                # Calcula custo estimado
+                cost_usd = (
+                    (usage.prompt_tokens / 1000) * COST_PER_1K_INPUT_TOKENS
+                    + (usage.completion_tokens / 1000) * COST_PER_1K_OUTPUT_TOKENS
+                )
+
+                # Atributos após a chamada
+                span.set_attribute("gen_ai.usage.input_tokens", usage.prompt_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
+                span.set_attribute("gen_ai.usage.total_tokens", usage.total_tokens)
+                span.set_attribute("llm.total_duration_ms", latency_ms)
+                span.set_attribute("llm.estimated_cost_usd", round(cost_usd, 6))
+                span.set_attribute("gen_ai.response.finish_reasons",
+                                   [response.choices[0].finish_reason])
+                span.set_status(Status(StatusCode.OK))
+
+                content = response.choices[0].message.content
+                return content, {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "estimated_cost_usd": cost_usd,
+                }
+
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                raise
+```
+
+---
+
+## Logs estruturados com trace_id
+
+```python
+# observability/logging.py
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+from opentelemetry import trace
+
+class StructuredJsonFormatter(logging.Formatter):
+    """Formata logs como JSON com trace_id injetado automaticamente."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        current_span = trace.get_current_span()
+        span_context = current_span.get_span_context()
+
+        log_entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "service": {"name": "ai-service"},
+            "trace": {
+                "trace_id": format(span_context.trace_id, "032x") if span_context.is_valid else None,
+                "span_id": format(span_context.span_id, "016x") if span_context.is_valid else None,
+            },
+        }
+
+        # Campos extras passados via extra={}
+        if hasattr(record, "__dict__"):
+            for key, value in record.__dict__.items():
+                if key not in logging.LogRecord.__dict__ and not key.startswith("_"):
+                    log_entry[key] = value
+
+        return json.dumps(log_entry, ensure_ascii=False)
+
+def setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(StructuredJsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+```
+
+---
+
+## Métricas customizadas
+
+```python
+# observability/metrics.py
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+meter = metrics.get_meter("ai-service")
+
+# Histograma de latência (para p50/p95/p99)
+llm_latency = meter.create_histogram(
+    name="llm.request.duration",
+    description="Latência de chamadas ao LLM em ms",
+    unit="ms",
+)
+
+# Contador de tokens
+llm_tokens_total = meter.create_counter(
+    name="llm.tokens.total",
+    description="Total de tokens consumidos",
+    unit="tokens",
+)
+
+# Contador de custo
+llm_cost_total = meter.create_counter(
+    name="llm.cost.usd",
+    description="Custo estimado de inferência em USD",
+    unit="USD",
+)
+
+def record_llm_metrics(
+    model: str,
+    feature: str,
+    latency_ms: int,
+    tokens: int,
+    cost_usd: float,
+    status: str = "ok",
+) -> None:
+    labels = {"model": model, "feature": feature, "status": status}
+    llm_latency.record(latency_ms, labels)
+    llm_tokens_total.add(tokens, labels)
+    llm_cost_total.add(cost_usd, labels)
+```
+
+---
+
+## Exportando para Jaeger (desenvolvimento local)
+
+Para validar a instrumentação localmente sem Datadog:
+
+```bash
+# Inicia Jaeger com OTLP receiver
+docker run --rm -p 16686:16686 -p 4318:4318 \
+  jaegertracing/all-in-one:latest \
+  --collector.otlp.enabled=true
+```
+
+```python
+# Acesse http://localhost:16686 para visualizar traces
+setup_tracing(service_name="ai-service", otlp_endpoint="http://localhost:4318")
+```
+
+---
+
+## O que monitorar em produção
+
+| Métrica | Por quê monitorar | Alerta quando |
+|---|---|---|
+| `llm.request.duration` p95 | Detecta degradação de latência | `>` 5s |
+| `llm.errors` | Rastreia falhas do provedor | Taxa `>` 1% |
+| `llm.cost.usd` por hora | Controle de gastos | `>` budget projetado |
+| `llm.tokens.total` | Uso de capacidade | Crescimento anômalo |
+| Cache hit rate | Eficiência do cache | `<` 70% para FAQs |
+
+---
+
+## Prática
+
+**Exercício:** Instrumente uma chamada de LLM com OpenTelemetry. O span deve incluir modelo, tokens e latência. Exporte para Jaeger local e valide os atributos.
+
+**Passo a passo:**
+
+1. Execute Jaeger com Docker (comando acima)
+2. Configure `setup_tracing(service_name="ai-service")`
+3. Implemente `InstrumentedLLMClient`
+4. Faça uma chamada e abra `http://localhost:16686`
+5. Valide que o span `llm.generate` aparece com todos os atributos
+6. Simule um erro e valide que aparece como `STATUS: ERROR` no span
+
+**Critérios de validação:**
+- Span `llm.generate` visível no Jaeger
+- Atributos `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` e `llm.total_duration_ms` presentes
+- Em caso de erro, `span.record_exception` captura o erro (não apenas o log)
+- `trace_id` aparece nos logs do serviço correlacionado com o span
+
+---
+
+## Checklist de qualidade
+
+- [ ] Toda chamada de LLM tem span dedicado com atributos de tokens e custo
+- [ ] `trace_id` é propagado para os logs automaticamente
+- [ ] Erros são registrados no span com `record_exception` (não apenas logados)
+- [ ] Métricas de latência (histograma) e custo (contador) estão instrumentadas
+- [ ] Logs usam formato JSON estruturado
+
+---
+
+> Próximo módulo: [LLMOps e Ciclo de Vida de IA](../15-llmops-lifecycle)

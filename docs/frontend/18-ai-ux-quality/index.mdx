@@ -1,14 +1,225 @@
 ﻿---
 sidebar_position: 2
 sidebar_label: "UX e qualidade percebida com IA"
-title: "UX e qualidade percebida com IA"
-description: "Módulo 18 do AI Engineering Course."
+title: "Qualidade de UX para IA"
+description: "Princípios práticos de UX para features de IA — comunicação de incerteza, confirmação de ações sensíveis, explicabilidade, confiança e acessibilidade."
 ---
 
-# UX e qualidade percebida com IA
+# Qualidade de UX para IA
 
-:::info Status do módulo
-**Status:** `not_started` — conteúdo em construção.
-:::
+## Objetivo
 
-> Este módulo será preenchido após a validação das skills correspondentes.
+Ao final deste módulo você consegue revisar uma interface de IA e identificar problemas de clareza, confiança e acessibilidade — propondo melhorias concretas para cada problema encontrado.
+
+---
+
+## Por que UX de IA é diferente
+
+Uma interface tradicional recebe comandos e exibe resultados determinísticos. Uma interface de IA lida com:
+
+- **Outputs não-determinísticos:** a mesma entrada pode gerar respostas diferentes
+- **Incerteza inerente:** o modelo não sabe o que não sabe — e pode apresentar erros com confiança
+- **Ações sugeridas, não executadas:** a IA propõe, o usuário decide
+- **Contexto acumulado:** o usuário espera que a conversa "lembre" do que foi dito
+
+A consequência: um modelo excelente pode produzir uma feature terrível se a UX não gerenciar essas características.
+
+---
+
+## Princípios de UX para features de IA
+
+### 1. Comunicação de incerteza
+
+O usuário precisa saber quando a resposta é provável vs. certa.
+
+**Ruim:**
+> "O paciente deve tomar 500mg de amoxicilina a cada 8 horas."
+
+**Melhor:**
+> "Com base nos dados fornecidos, a dosagem mais comum é 500mg a cada 8 horas — confirme com o profissional de saúde responsável."
+
+Mecanismos visuais:
+- Ícone `⚠` ou tag "Gerado por IA" próximo à resposta
+- Porcentagem de confiança quando o backend fornece
+- Nota explícita em domínios críticos (saúde, finanças, jurídico)
+
+### 2. Confirmação de ações sensíveis
+
+Ações irreversíveis ou de alto impacto precisam de confirmação explícita, mesmo que sugeridas pela IA.
+
+```tsx
+// components/ConfirmActionDialog.tsx
+interface ConfirmActionDialogProps {
+  action: string;          // "Enviar e-mail para 142 contatos"
+  impact: string;          // "Esta ação não pode ser desfeita."
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+export function ConfirmActionDialog({
+  action, impact, onConfirm, onCancel,
+}: ConfirmActionDialogProps) {
+  return (
+    <dialog open aria-modal="true" aria-labelledby="confirm-title">
+      <h2 id="confirm-title">Confirmar ação sugerida pela IA</h2>
+      <p><strong>O que será feito:</strong> {action}</p>
+      <p className="warning">{impact}</p>
+      <div>
+        <button onClick={onCancel}>Cancelar</button>
+        <button onClick={onConfirm} className="destructive">
+          Confirmar
+        </button>
+      </div>
+    </dialog>
+  );
+}
+```
+
+**Critério:** o botão de confirmação não é o padrão (não é o primeiro, não é `Enter`).
+
+### 3. Clareza da resposta
+
+| Problema | Sintoma | Solução |
+|---|---|---|
+| Resposta longa demais | Usuário para de ler na metade | Resumo no início, detalhes em `details/summary` |
+| Jargão técnico | Usuário não age | Adaptar linguagem ao público-alvo |
+| Resposta ambígua | Usuário pede esclarecimento | Formatação: listas, negrito, cabeçalhos |
+| Sem call-to-action | Usuário não sabe próximo passo | Próximos passos sugeridos ao final |
+
+### 4. Explicabilidade
+
+Quando o usuário precisa entender *por que* a IA chegou a uma conclusão:
+
+```tsx
+// components/ExplainabilityPanel.tsx
+interface ExplainabilityPanelProps {
+  reasoning?: string;
+  sources?: Array<{ title: string; url?: string }>;
+}
+
+export function ExplainabilityPanel({ reasoning, sources }: ExplainabilityPanelProps) {
+  if (!reasoning && (!sources || sources.length === 0)) return null;
+
+  return (
+    <details className="explainability-panel">
+      <summary>Por que essa resposta?</summary>
+      {reasoning && <p className="reasoning">{reasoning}</p>}
+      {sources && sources.length > 0 && (
+        <ol>
+          {sources.map((s, i) => (
+            <li key={i}>
+              {s.url ? (
+                <a href={s.url} target="_blank" rel="noopener noreferrer">{s.title}</a>
+              ) : (
+                s.title
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </details>
+  );
+}
+```
+
+### 5. Acessibilidade em fluxos de IA
+
+Requisitos mínimos (WCAG AA):
+
+```tsx
+// Regiões aria-live para conteúdo dinâmico
+<div
+  role="status"
+  aria-live="polite"
+  aria-label="Resposta da IA"
+>
+  {content}
+</div>
+
+// Estados de erro como alertas
+<div role="alert">
+  Não foi possível gerar a resposta. Tente novamente.
+</div>
+
+// Botões com estados claros
+<button
+  disabled={isLoading}
+  aria-disabled={isLoading}
+  aria-label={isLoading ? 'Gerando resposta...' : 'Enviar mensagem'}
+>
+  {isLoading ? 'Aguardando...' : 'Enviar'}
+</button>
+```
+
+Checklist de acessibilidade:
+- Contraste mínimo 4.5:1 para texto normal, 3:1 para texto grande
+- Toda interação disponível por teclado
+- Spinner tem `role="status"` e texto alternativo
+- Conteúdo streaming usa `aria-live="polite"` (não `assertive`)
+
+### 6. O que a UI não deve permitir ao modelo decidir sozinho
+
+| Ação | Por quê requer controle explícito |
+|---|---|
+| Enviar e-mail ou mensagem | Irreversível, impacta terceiros |
+| Excluir dados | Irreversível |
+| Efetuar pagamento | Alto impacto financeiro |
+| Publicar conteúdo | Visibilidade pública |
+| Compartilhar dados sensíveis | Privacidade |
+
+Regra: **sugerir sim, executar automaticamente não**.
+
+---
+
+## Análise de interface: exemplo prático
+
+Considere um assistente de atendimento ao cliente que:
+
+1. Exibe uma sugestão de resposta ao atendente
+2. Tem botão "Enviar para cliente" que executa diretamente
+3. Não indica que o texto foi gerado por IA
+4. Não funciona com leitor de tela
+
+**Problemas identificados:**
+
+| # | Categoria | Problema | Impacto no usuário | Melhoria |
+|---|---|---|---|---|
+| 1 | Confiança | Ausência de indicador "Gerado por IA" | Atendente assume que é texto verificado, envia sem revisar | Adicionar tag "IA" próxima à sugestão |
+| 2 | Clareza | Botão "Enviar" executa sem confirmação | Mensagem incorreta enviada ao cliente | Adicionar diálogo de confirmação com prévia da mensagem |
+| 3 | Acessibilidade | Conteúdo dinâmico sem `aria-live` | Usuário de leitor de tela não percebe que nova sugestão apareceu | Envolver área de sugestão em `role="status"` |
+
+---
+
+## Prática
+
+**Exercício:** Escolha uma interface de IA (produto real ou mockup). Identifique 3 problemas de qualidade de UX — um de clareza, um de confiança e um de acessibilidade.
+
+Para cada problema, preencha a tabela:
+
+| Categoria | Problema observado | Impacto no usuário | Melhoria proposta |
+|---|---|---|---|
+| Clareza | | | |
+| Confiança | | | |
+| Acessibilidade | | | |
+
+**Critérios de validação:**
+- 3 problemas distintos identificados (um por categoria)
+- Cada problema descrito em termos do usuário (não tecnicamente)
+- Cada melhoria é concreta e implementável sem quebrar funcionalidade
+
+---
+
+## Checklist de qualidade
+
+- [ ] Incerteza é comunicada de forma que o usuário entende
+- [ ] Ações irreversíveis têm confirmação explícita
+- [ ] Linguagem da resposta é adequada para o público-alvo
+- [ ] Contraste e tamanho de fonte atendem WCAG AA mínimo
+- [ ] O usuário sabe o que fazer quando a IA não consegue ajudar
+- [ ] Conteúdo dinâmico usa `aria-live` para leitores de tela
+
+---
+
+> Ver: [Frontend React para IA](../17-react-ai-frontend) — a implementação dos componentes avaliados
+
+> Próximo módulo: [Integração frontend-backend para IA](../19-frontend-backend-integration)
