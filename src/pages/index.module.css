@@ -1,23 +1,293 @@
-/**
- * CSS files with the .module.css suffix will be treated as CSS modules
- * and scoped locally.
- */
+/* ─── Hero ─────────────────────────────────────────────────── */
 
-.heroBanner {
-  padding: 4rem 0;
+.hero {
+  background: linear-gradient(135deg, #0f0c29 0%, #1a1040 50%, #0d1b2a 100%);
+  padding: 6rem 0 5rem;
   text-align: center;
   position: relative;
   overflow: hidden;
 }
 
-@media screen and (max-width: 996px) {
-  .heroBanner {
-    padding: 2rem;
+.hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(99, 102, 241, 0.25) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.heroInner {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+}
+
+.heroBadge {
+  display: inline-block;
+  background: rgba(99, 102, 241, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  color: #a5b4fc;
+  border-radius: 999px;
+  padding: 0.35rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  margin-bottom: 1.5rem;
+}
+
+.heroTitle {
+  font-size: 3.5rem !important;
+  font-weight: 800 !important;
+  color: #ffffff !important;
+  line-height: 1.15 !important;
+  margin-bottom: 1.25rem !important;
+  letter-spacing: -0.02em;
+}
+
+.heroSubtitle {
+  font-size: 1.2rem;
+  color: #94a3b8;
+  max-width: 600px;
+  margin: 0 auto 2.5rem;
+  line-height: 1.65;
+}
+
+.heroButtons {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.btnPrimary {
+  background: #6366f1 !important;
+  border-color: #6366f1 !important;
+  color: #ffffff !important;
+  font-weight: 600;
+}
+
+.btnPrimary:hover {
+  background: #4f46e5 !important;
+  border-color: #4f46e5 !important;
+  color: #ffffff !important;
+}
+
+.btnSecondary {
+  background: transparent !important;
+  border: 2px solid rgba(99, 102, 241, 0.5) !important;
+  color: #a5b4fc !important;
+  font-weight: 600;
+}
+
+.btnSecondary:hover {
+  background: rgba(99, 102, 241, 0.1) !important;
+  border-color: rgba(99, 102, 241, 0.8) !important;
+  color: #c7d2fe !important;
+}
+
+@media (max-width: 996px) {
+  .hero {
+    padding: 4rem 0 3rem;
+  }
+  .heroTitle {
+    font-size: 2.25rem !important;
   }
 }
 
-.buttons {
+/* ─── Stats Bar ─────────────────────────────────────────────── */
+
+.statsBar {
   display: flex;
-  align-items: center;
   justify-content: center;
+  align-items: center;
+  gap: 3rem;
+  padding: 1.75rem 2rem;
+  background: var(--ifm-background-surface-color);
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+  flex-wrap: wrap;
 }
+
+.statItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.statValue {
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: var(--ifm-color-primary);
+  line-height: 1;
+}
+
+.statLabel {
+  font-size: 0.78rem;
+  color: var(--ifm-color-emphasis-600);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+}
+
+/* ─── Tracks Section ────────────────────────────────────────── */
+
+.tracksSection {
+  padding: 5rem 0;
+}
+
+.sectionTitle {
+  text-align: center;
+  font-size: 2rem !important;
+  font-weight: 800 !important;
+  margin-bottom: 0.5rem !important;
+}
+
+.sectionSubtitle {
+  text-align: center;
+  color: var(--ifm-color-emphasis-600);
+  font-size: 1.1rem;
+  margin-bottom: 3rem;
+}
+
+.tracksGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.5rem;
+}
+
+@media (max-width: 996px) {
+  .tracksGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.trackCard {
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  padding: 2rem;
+  border: 1px solid var(--ifm-toc-border-color);
+  background: var(--ifm-background-surface-color);
+  text-decoration: none !important;
+  color: var(--ifm-font-color-base) !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.trackCard:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+  text-decoration: none !important;
+}
+
+.trackEmoji {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+}
+
+.trackMeta {
+  margin-bottom: 0.75rem;
+}
+
+.trackSubtitle {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.trackTitle {
+  font-size: 1.5rem !important;
+  font-weight: 800 !important;
+  margin: 0 !important;
+  color: var(--ifm-font-color-base) !important;
+}
+
+.trackDescription {
+  font-size: 0.95rem;
+  color: var(--ifm-color-emphasis-700);
+  line-height: 1.6;
+  margin-bottom: 1.25rem;
+  flex: 1;
+}
+
+.trackList {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.trackList li {
+  font-size: 0.875rem;
+  padding-left: 1.25rem;
+  position: relative;
+  color: var(--ifm-font-color-base);
+}
+
+.trackList li::before {
+  content: '→';
+  position: absolute;
+  left: 0;
+  opacity: 0.45;
+  font-size: 0.8rem;
+}
+
+.trackCta {
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* Accent colors per track */
+.track_core .trackSubtitle,
+.track_core .trackCta { color: #8b5cf6; }
+.track_core:hover { border-color: #8b5cf6; }
+
+.track_backend .trackSubtitle,
+.track_backend .trackCta { color: #6366f1; }
+.track_backend:hover { border-color: #6366f1; }
+
+.track_frontend .trackSubtitle,
+.track_frontend .trackCta { color: #0ea5e9; }
+.track_frontend:hover { border-color: #0ea5e9; }
+
+/* ─── Stack Section ─────────────────────────────────────────── */
+
+.stackSection {
+  padding: 3.5rem 0 4.5rem;
+  text-align: center;
+  border-top: 1px solid var(--ifm-toc-border-color);
+}
+
+.stackLabel {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ifm-color-emphasis-600);
+  font-weight: 600;
+  margin-bottom: 1.25rem;
+}
+
+.stackGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  justify-content: center;
+  max-width: 700px;
+  margin: 0 auto;
+}
+
+.stackBadge {
+  background: var(--ifm-background-surface-color);
+  border: 1px solid var(--ifm-toc-border-color);
+  border-radius: 6px;
+  padding: 0.35rem 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--ifm-font-color-base);
+}
+
